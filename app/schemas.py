@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, field_validator
 from datetime import datetime, date
-from typing import Optional, List
+import json
+from typing import Optional, List, Any
 from app.models import WindowStatus, AuditAction, TemplateAction, ConflictType
 
 
@@ -290,6 +291,22 @@ class BatchGenerateRecord(BaseModel):
     fail_count: int
     status: str
     created_at: datetime
+
+    @field_validator("specific_dates", mode="before")
+    @classmethod
+    def _parse_specific_dates(cls, v: Any) -> Optional[List[str]]:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
 
     class Config:
         from_attributes = True

@@ -295,6 +295,12 @@ def get_batch_record(batch_id: int, db: Session = Depends(get_db)):
     precheck = []
     if record.precheck_result:
         precheck = json.loads(record.precheck_result)
+    specific_dates = None
+    if record.specific_dates:
+        try:
+            specific_dates = json.loads(record.specific_dates)
+        except (json.JSONDecodeError, TypeError):
+            specific_dates = None
     return {
         "id": record.id,
         "template_id": record.template_id,
@@ -304,6 +310,7 @@ def get_batch_record(batch_id: int, db: Session = Depends(get_db)):
         "generate_mode": record.generate_mode,
         "date_from": record.date_from.isoformat() if record.date_from else None,
         "date_to": record.date_to.isoformat() if record.date_to else None,
+        "specific_dates": specific_dates,
         "total_count": record.total_count,
         "success_count": record.success_count,
         "skip_count": record.skip_count,
