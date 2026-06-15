@@ -3,15 +3,20 @@
 演示内容：
 1. 配置初始化（环境、维护时段、角色、用户）
 2. 主流程：草稿 -> 已提交 -> 已批准 -> 执行中 -> 完成 -> 导出
-3. 失败链路：结束时间早于开始时间、同环境时间重叠、非审批角色无法批准
-4. 回滚/撤销：保留完整历史，不抹除原有记录
+3. 失败链路：
+   - 结束时间早于开始时间（直接拦截）
+   - 同环境时间重叠（允许SUBMITTED，审批时才冲突）
+   - 非审批角色无法批准（403）
+4. 回滚/撤销：状态恢复到上一可操作状态（不是独立回滚态），完整历史不抹除
 5. 服务重启一致性：关闭数据库后重新连接，验证数据一致
+6. 导出隔离：导出产物落到系统临时目录，不污染仓库
 """
 
 import sys
 import os
 import io
 import json
+import tempfile
 from datetime import datetime, timedelta
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -151,12 +156,13 @@ def main():
         "audit_actions": [log["action"] for log in export_data["audit_logs"]],
     })
 
-    export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports")
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
     os.makedirs(export_dir, exist_ok=True)
     export_path = os.path.join(export_dir, f"window_{window.id}_demo.json")
     with open(export_path, "w", encoding="utf-8") as f:
         json.dump(export_data, f, ensure_ascii=False, indent=2)
     print(f"\n[OK] Export file saved: {export_path}")
+    print(f"[OK] Storage: {export_path}")
 
     verified_window_id = window.id
 
@@ -216,13 +222,18 @@ def main():
     ))
     print(f"[OK] Draft created: id={window_overlap.id} status={window_overlap.status.value}")
 
+    window_overlap = services.submit_window(db, window_overlap.id, schemas.SubmitRequest(
+        operator_id=user_dev.id,
+    ))
+    print(f"[OK] Overlap window SUBMITTED: status={window_overlap.status.value} (submit no longer blocks)")
+
     try:
-        services.submit_window(db, window_overlap.id, schemas.SubmitRequest(
-            operator_id=user_dev.id,
+        services.approve_window(db, window_overlap.id, schemas.ApproveRequest(
+            operator_id=user_approver.id,
         ))
-        print("FAIL: Should have been blocked!")
+        print("FAIL: Should have been blocked on approve!")
     except services.BusinessError as e:
-        print(f"[OK] Overlap blocked on submit: {e.message}")
+        print(f"[OK] Overlap blocked on APPROVE (correct behavior): {e.message}")
 
     # ================================================================
     # Part 5: Failure - Non-approver cannot approve
@@ -317,7 +328,7 @@ def main():
 
     passed = True
     checks = [
-        (reloaded_rollback["status"] == "ROLLED_BACK", "Rollback status inconsistent after restart"),
+        (reloaded_rollback["status"] == "APPROVED", "Rollback status inconsistent after restart (should be APPROVED, not ROLLED_BACK)"),
         (reloaded_rollback["rollback_note"] is not None, "Rollback note lost after restart"),
         (reloaded["status"] == "COMPLETED", "Main flow status inconsistent after restart"),
         (reloaded["approver"]["display_name"] == "Zhang Manager", "Approver name inconsistent after restart"),
