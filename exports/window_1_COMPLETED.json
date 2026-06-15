@@ -1,0 +1,157 @@
+{
+  "window_id": 1,
+  "title": "Production DB upgrade",
+  "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+  "status": "COMPLETED",
+  "environment": {
+    "id": 1,
+    "name": "production",
+    "description": "production env, strict approval required"
+  },
+  "time_range": {
+    "start_time": "2026-06-20T02:00:00",
+    "end_time": "2026-06-20T04:00:00"
+  },
+  "creator": {
+    "id": 2,
+    "username": "dev.li",
+    "display_name": "Li Developer"
+  },
+  "approver": {
+    "id": 1,
+    "username": "manager.zhang",
+    "display_name": "Zhang Manager"
+  },
+  "approval_reason": "Risk assessed, approved for maintenance window",
+  "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+  "rollback_note": null,
+  "created_at": "2026-06-15T17:43:57.847387",
+  "updated_at": "2026-06-15T17:43:58.506053",
+  "audit_logs": [
+    {
+      "id": 1,
+      "action": "CREATE",
+      "operator_id": 2,
+      "operator_name": "Li Developer",
+      "operator_username": "dev.li",
+      "from_status": null,
+      "to_status": "DRAFT",
+      "reason": "Fix security vulnerability CVE-2024-XXXX",
+      "snapshot": {
+        "id": 1,
+        "title": "Production DB upgrade",
+        "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+        "environment_id": 1,
+        "start_time": "2026-06-20T02:00:00",
+        "end_time": "2026-06-20T04:00:00",
+        "status": "DRAFT",
+        "creator_id": 2,
+        "approver_id": null,
+        "approval_reason": null,
+        "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T17:43:57.876606"
+    },
+    {
+      "id": 2,
+      "action": "SUBMIT",
+      "operator_id": 2,
+      "operator_name": "Li Developer",
+      "operator_username": "dev.li",
+      "from_status": "DRAFT",
+      "to_status": "SUBMITTED",
+      "reason": "Change ready, requesting approval",
+      "snapshot": {
+        "id": 1,
+        "title": "Production DB upgrade",
+        "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+        "environment_id": 1,
+        "start_time": "2026-06-20T02:00:00",
+        "end_time": "2026-06-20T04:00:00",
+        "status": "SUBMITTED",
+        "creator_id": 2,
+        "approver_id": null,
+        "approval_reason": null,
+        "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T17:43:58.145167"
+    },
+    {
+      "id": 3,
+      "action": "APPROVE",
+      "operator_id": 1,
+      "operator_name": "Zhang Manager",
+      "operator_username": "manager.zhang",
+      "from_status": "SUBMITTED",
+      "to_status": "APPROVED",
+      "reason": "Risk assessed, approved for maintenance window",
+      "snapshot": {
+        "id": 1,
+        "title": "Production DB upgrade",
+        "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+        "environment_id": 1,
+        "start_time": "2026-06-20T02:00:00",
+        "end_time": "2026-06-20T04:00:00",
+        "status": "APPROVED",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "Risk assessed, approved for maintenance window",
+        "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T17:43:58.275081"
+    },
+    {
+      "id": 4,
+      "action": "START",
+      "operator_id": 2,
+      "operator_name": "Li Developer",
+      "operator_username": "dev.li",
+      "from_status": "APPROVED",
+      "to_status": "IN_PROGRESS",
+      "reason": "开始执行维护",
+      "snapshot": {
+        "id": 1,
+        "title": "Production DB upgrade",
+        "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+        "environment_id": 1,
+        "start_time": "2026-06-20T02:00:00",
+        "end_time": "2026-06-20T04:00:00",
+        "status": "IN_PROGRESS",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "Risk assessed, approved for maintenance window",
+        "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T17:43:58.321942"
+    },
+    {
+      "id": 5,
+      "action": "COMPLETE",
+      "operator_id": 2,
+      "operator_name": "Li Developer",
+      "operator_username": "dev.li",
+      "from_status": "IN_PROGRESS",
+      "to_status": "COMPLETED",
+      "reason": "维护完成",
+      "snapshot": {
+        "id": 1,
+        "title": "Production DB upgrade",
+        "description": "Upgrade MySQL 8.0.30 to 8.0.36",
+        "environment_id": 1,
+        "start_time": "2026-06-20T02:00:00",
+        "end_time": "2026-06-20T04:00:00",
+        "status": "COMPLETED",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "Risk assessed, approved for maintenance window",
+        "change_reason": "Fix security vulnerability CVE-2024-XXXX",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T17:43:58.509434"
+    }
+  ]
+}
