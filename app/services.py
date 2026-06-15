@@ -1,11 +1,11 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import json
 from typing import List, Optional
 
 from app import models, schemas
-from app.models import WindowStatus, AuditAction
+from app.models import WindowStatus, AuditAction, TemplateAction, ConflictType
 
 
 class BusinessError(Exception):
@@ -546,3 +546,635 @@ def export_window_records(db: Session, win_id: int) -> dict:
         "updated_at": db_win.updated_at.isoformat() if db_win.updated_at else None,
         "audit_logs": audit_records,
     }
+
+
+# ============== Window Template ==============
+
+def _template_snapshot(template: models.WindowTemplate) -> str:
+    return json.dumps({
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "environment_id": template.environment_id,
+        "start_time": template.start_time,
+        "end_time": template.end_time,
+        "change_reason": template.change_reason,
+        "is_shared": template.is_shared,
+        "creator_id": template.creator_id,
+    }, ensure_ascii=False)
+
+
+def _add_template_audit_log(
+    db: Session,
+    template: models.WindowTemplate,
+    action: TemplateAction,
+    operator_id: int,
+    detail: Optional[str] = None,
+):
+    log = models.TemplateAuditLog(
+        template_id=template.id,
+        action=action,
+        operator_id=operator_id,
+        detail=detail,
+        snapshot=_template_snapshot(template),
+    )
+    db.add(log)
+
+
+def _validate_template_time(start_time: str, end_time: str):
+    try:
+        sh, sm = map(int, start_time.split(":"))
+        eh, em = map(int, end_time.split(":"))
+        start_minutes = sh * 60 + sm
+        end_minutes = eh * 60 + em
+        if end_minutes <= start_minutes:
+            raise BusinessError("模板结束时间必须晚于开始时间")
+    except ValueError:
+        raise BusinessError("时间格式不正确，应为 HH:MM")
+
+
+def _check_template_permission(
+    db: Session,
+    template: models.WindowTemplate,
+    operator_id: int,
+    action: str = "modify",
+):
+    operator = get_user(db, operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={operator_id} 不存在", 404)
+    
+    is_owner = template.creator_id == operator_id
+    is_approver = user_can_approve(db, operator_id)
+    is_shared = template.is_shared == 1
+    
+    if is_owner:
+        return True
+    
+    if is_shared:
+        if action == "view":
+            return True
+        if action == "use":
+            return True
+        if is_approver:
+            return True
+        raise BusinessError(
+            f"无权限{action_description(action)}该共享模板（非审批角色不能修改他人共享模板）",
+            403,
+        )
+    
+    raise BusinessError(f"无权限{action_description(action)}该私有模板", 403)
+
+
+def action_description(action: str) -> str:
+    mapping = {
+        "view": "查看",
+        "use": "使用",
+        "modify": "修改",
+        "delete": "删除",
+        "share": "分享",
+    }
+    return mapping.get(action, action)
+
+
+def create_window_template(
+    db: Session, tpl_in: schemas.WindowTemplateCreate
+) -> models.WindowTemplate:
+    _validate_template_time(tpl_in.start_time, tpl_in.end_time)
+    
+    existing = db.query(models.WindowTemplate).filter(
+        models.WindowTemplate.name == tpl_in.name,
+        models.WindowTemplate.creator_id == tpl_in.creator_id,
+    ).first()
+    if existing:
+        raise BusinessError(f"模板名称 '{tpl_in.name}' 已存在")
+    
+    env = get_environment(db, tpl_in.environment_id)
+    if not env:
+        raise BusinessError(f"环境 ID={tpl_in.environment_id} 不存在", 404)
+    
+    creator = get_user(db, tpl_in.creator_id)
+    if not creator:
+        raise BusinessError(f"创建人 ID={tpl_in.creator_id} 不存在", 404)
+    
+    db_tpl = models.WindowTemplate(**tpl_in.model_dump())
+    db.add(db_tpl)
+    db.flush()
+    
+    _add_template_audit_log(
+        db, db_tpl, TemplateAction.TEMPLATE_CREATE, tpl_in.creator_id,
+        detail=f"创建模板: {tpl_in.name}",
+    )
+    
+    db.commit()
+    db.refresh(db_tpl)
+    return db_tpl
+
+
+def get_window_template(db: Session, tpl_id: int) -> Optional[models.WindowTemplate]:
+    return db.query(models.WindowTemplate).filter(models.WindowTemplate.id == tpl_id).first()
+
+
+def list_window_templates(
+    db: Session,
+    user_id: Optional[int] = None,
+    environment_id: Optional[int] = None,
+    is_shared: Optional[int] = None,
+) -> List[models.WindowTemplate]:
+    q = db.query(models.WindowTemplate)
+    if user_id is not None:
+        q = q.filter(
+            or_(
+                models.WindowTemplate.creator_id == user_id,
+                models.WindowTemplate.is_shared == 1,
+            )
+        )
+    if environment_id is not None:
+        q = q.filter(models.WindowTemplate.environment_id == environment_id)
+    if is_shared is not None:
+        q = q.filter(models.WindowTemplate.is_shared == is_shared)
+    return q.order_by(models.WindowTemplate.updated_at.desc()).all()
+
+
+def update_window_template(
+    db: Session, tpl_id: int, tpl_in: schemas.WindowTemplateUpdate, operator_id: int
+) -> models.WindowTemplate:
+    db_tpl = get_window_template(db, tpl_id)
+    if not db_tpl:
+        raise BusinessError(f"模板 ID={tpl_id} 不存在", 404)
+    
+    _check_template_permission(db, db_tpl, operator_id, "modify")
+    
+    update_data = tpl_in.model_dump(exclude_unset=True)
+    
+    if "name" in update_data:
+        existing = db.query(models.WindowTemplate).filter(
+            models.WindowTemplate.name == update_data["name"],
+            models.WindowTemplate.creator_id == db_tpl.creator_id,
+            models.WindowTemplate.id != tpl_id,
+        ).first()
+        if existing:
+            raise BusinessError(f"模板名称 '{update_data['name']}' 已存在")
+    
+    new_start = update_data.get("start_time", db_tpl.start_time)
+    new_end = update_data.get("end_time", db_tpl.end_time)
+    _validate_template_time(new_start, new_end)
+    
+    if "environment_id" in update_data:
+        env = get_environment(db, update_data["environment_id"])
+        if not env:
+            raise BusinessError(f"环境 ID={update_data['environment_id']} 不存在", 404)
+    
+    old_shared = db_tpl.is_shared
+    for k, v in update_data.items():
+        setattr(db_tpl, k, v)
+    db_tpl.updated_at = datetime.utcnow()
+    
+    action = TemplateAction.TEMPLATE_UPDATE
+    detail = "更新模板内容"
+    if "is_shared" in update_data:
+        if old_shared == 0 and update_data["is_shared"] == 1:
+            action = TemplateAction.TEMPLATE_SHARE
+            detail = "分享模板"
+        elif old_shared == 1 and update_data["is_shared"] == 0:
+            action = TemplateAction.TEMPLATE_UNSHARE
+            detail = "取消分享模板"
+    
+    _add_template_audit_log(db, db_tpl, action, operator_id, detail=detail)
+    
+    db.commit()
+    db.refresh(db_tpl)
+    return db_tpl
+
+
+def delete_window_template(db: Session, tpl_id: int, operator_id: int) -> None:
+    db_tpl = get_window_template(db, tpl_id)
+    if not db_tpl:
+        raise BusinessError(f"模板 ID={tpl_id} 不存在", 404)
+    
+    _check_template_permission(db, db_tpl, operator_id, "delete")
+    
+    db.delete(db_tpl)
+    db.commit()
+
+
+# ============== Batch Generate & Precheck ==============
+
+def _parse_dates_from_request(req: schemas.BatchGenerateRequest) -> List[date]:
+    if req.generate_mode == "date_range":
+        if not req.date_from or not req.date_to:
+            raise BusinessError("日期范围模式需要提供 date_from 和 date_to")
+        if req.date_to < req.date_from:
+            raise BusinessError("date_to 不能早于 date_from")
+        dates = []
+        current = req.date_from
+        while current <= req.date_to:
+            dates.append(current)
+            current += timedelta(days=1)
+        return dates
+    elif req.generate_mode == "specific_dates":
+        if not req.specific_dates or len(req.specific_dates) == 0:
+            raise BusinessError("指定日期模式需要提供 specific_dates")
+        return sorted(set(req.specific_dates))
+    else:
+        raise BusinessError(f"不支持的生成模式: {req.generate_mode}")
+
+
+def _combine_datetime(d: date, time_str: str) -> datetime:
+    h, m = map(int, time_str.split(":"))
+    return datetime(d.year, d.month, d.day, h, m)
+
+
+def precheck_batch_windows(
+    db: Session,
+    template: models.WindowTemplate,
+    dates: List[date],
+) -> List[schemas.PreCheckItem]:
+    results = []
+    
+    for d in dates:
+        start_dt = _combine_datetime(d, template.start_time)
+        end_dt = _combine_datetime(d, template.end_time)
+        
+        item = schemas.PreCheckItem(
+            date=d.isoformat(),
+            start_time=template.start_time,
+            end_time=template.end_time,
+            conflict_type=ConflictType.OK,
+            message="可创建",
+        )
+        
+        overlaps = check_time_overlap(db, template.environment_id, start_dt, end_dt)
+        
+        if overlaps:
+            w = overlaps[0]
+            item.conflict_window_id = w.id
+            item.conflict_window_title = w.title
+            item.conflict_window_status = w.status.value if w.status else None
+            
+            if w.status == WindowStatus.SUBMITTED:
+                item.conflict_type = ConflictType.PENDING_APPROVAL
+                item.message = f"存在审批中窗口: {w.title}（不可覆盖）"
+            else:
+                item.conflict_type = ConflictType.TIME_OVERLAP
+                item.message = f"时间重叠: {w.title}（状态: {w.status.value if w.status else '未知'}）"
+        
+        results.append(item)
+    
+    return results
+
+
+def batch_generate_windows(
+    db: Session, req: schemas.BatchGenerateRequest
+) -> schemas.BatchGenerateResult:
+    template = get_window_template(db, req.template_id)
+    if not template:
+        raise BusinessError(f"模板 ID={req.template_id} 不存在", 404)
+    
+    _check_template_permission(db, template, req.operator_id, "use")
+    
+    operator = get_user(db, req.operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
+    
+    dates = _parse_dates_from_request(req)
+    if len(dates) == 0:
+        raise BusinessError("没有可生成的日期")
+    
+    precheck_items = precheck_batch_windows(db, template, dates)
+    
+    date_from = min(dates)
+    date_to = max(dates)
+    
+    batch_record = models.BatchGenerateRecord(
+        template_id=template.id,
+        template_name=template.name,
+        creator_id=req.operator_id,
+        environment_id=template.environment_id,
+        generate_mode=req.generate_mode,
+        date_from=_combine_datetime(date_from, template.start_time),
+        date_to=_combine_datetime(date_to, template.end_time),
+        total_count=len(dates),
+        success_count=0,
+        skip_count=0,
+        fail_count=0,
+        precheck_result=json.dumps([item.model_dump() for item in precheck_items], ensure_ascii=False),
+        status="PRECHECKED",
+    )
+    db.add(batch_record)
+    db.flush()
+    
+    created_windows = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    if req.auto_create:
+        for item in precheck_items:
+            if item.conflict_type == ConflictType.OK:
+                try:
+                    d = date.fromisoformat(item.date)
+                    start_dt = _combine_datetime(d, template.start_time)
+                    end_dt = _combine_datetime(d, template.end_time)
+                    
+                    win = create_maintenance_window(db, schemas.MaintenanceWindowCreate(
+                        title=f"{template.name} - {d.isoformat()}",
+                        description=template.description or "",
+                        environment_id=template.environment_id,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        creator_id=req.operator_id,
+                        change_reason=template.change_reason or f"批量生成自模板: {template.name}",
+                    ))
+                    created_windows.append(win)
+                    success_count += 1
+                except Exception:
+                    fail_count += 1
+            else:
+                skip_count += 1
+        
+        batch_record.success_count = success_count
+        batch_record.skip_count = skip_count
+        batch_record.fail_count = fail_count
+        batch_record.status = "COMPLETED"
+        
+        _add_template_audit_log(
+            db, template, TemplateAction.BATCH_GENERATE, req.operator_id,
+            detail=f"批量生成 {len(dates)} 条窗口，成功 {success_count}，跳过 {skip_count}，失败 {fail_count}",
+        )
+    
+    db.commit()
+    db.refresh(batch_record)
+    
+    return schemas.BatchGenerateResult(
+        batch_id=batch_record.id,
+        total_count=len(dates),
+        success_count=success_count,
+        skip_count=skip_count,
+        fail_count=fail_count,
+        status=batch_record.status,
+        precheck_items=precheck_items,
+        created_windows=created_windows,
+    )
+
+
+def confirm_batch_generate(
+    db: Session, batch_id: int, operator_id: int
+) -> schemas.BatchGenerateResult:
+    batch = db.query(models.BatchGenerateRecord).filter(
+        models.BatchGenerateRecord.id == batch_id
+    ).first()
+    if not batch:
+        raise BusinessError(f"批量生成记录 ID={batch_id} 不存在", 404)
+    
+    if batch.status == "COMPLETED":
+        precheck_items = [
+            schemas.PreCheckItem(**item) for item in json.loads(batch.precheck_result)
+        ]
+        return schemas.BatchGenerateResult(
+            batch_id=batch.id,
+            total_count=batch.total_count,
+            success_count=batch.success_count,
+            skip_count=batch.skip_count,
+            fail_count=batch.fail_count,
+            status=batch.status,
+            precheck_items=precheck_items,
+            created_windows=[],
+        )
+    
+    if batch.status != "PRECHECKED":
+        raise BusinessError(f"当前状态 {batch.status} 不能确认生成")
+    
+    template = get_window_template(db, batch.template_id) if batch.template_id else None
+    if not template:
+        raise BusinessError(f"关联模板不存在", 404)
+    
+    _check_template_permission(db, template, operator_id, "use")
+    
+    precheck_items = [
+        schemas.PreCheckItem(**item) for item in json.loads(batch.precheck_result)
+    ]
+    
+    created_windows = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    for item in precheck_items:
+        if item.conflict_type == ConflictType.OK:
+            try:
+                d = date.fromisoformat(item.date)
+                start_dt = _combine_datetime(d, template.start_time)
+                end_dt = _combine_datetime(d, template.end_time)
+                
+                win = create_maintenance_window(db, schemas.MaintenanceWindowCreate(
+                    title=f"{template.name} - {d.isoformat()}",
+                    description=template.description or "",
+                    environment_id=template.environment_id,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    creator_id=operator_id,
+                    change_reason=template.change_reason or f"批量生成自模板: {template.name}",
+                ))
+                created_windows.append(win)
+                success_count += 1
+            except Exception:
+                fail_count += 1
+        else:
+            skip_count += 1
+    
+    batch.success_count = success_count
+    batch.skip_count = skip_count
+    batch.fail_count = fail_count
+    batch.status = "COMPLETED"
+    
+    if template:
+        _add_template_audit_log(
+            db, template, TemplateAction.BATCH_GENERATE, operator_id,
+            detail=f"批量生成 {len(precheck_items)} 条窗口，成功 {success_count}，跳过 {skip_count}，失败 {fail_count}",
+        )
+    
+    db.commit()
+    db.refresh(batch)
+    
+    return schemas.BatchGenerateResult(
+        batch_id=batch.id,
+        total_count=batch.total_count,
+        success_count=success_count,
+        skip_count=skip_count,
+        fail_count=fail_count,
+        status=batch.status,
+        precheck_items=precheck_items,
+        created_windows=created_windows,
+    )
+
+
+def list_batch_records(
+    db: Session,
+    template_id: Optional[int] = None,
+    creator_id: Optional[int] = None,
+) -> List[models.BatchGenerateRecord]:
+    q = db.query(models.BatchGenerateRecord)
+    if template_id is not None:
+        q = q.filter(models.BatchGenerateRecord.template_id == template_id)
+    if creator_id is not None:
+        q = q.filter(models.BatchGenerateRecord.creator_id == creator_id)
+    return q.order_by(models.BatchGenerateRecord.created_at.desc()).all()
+
+
+def get_batch_record(db: Session, batch_id: int) -> Optional[models.BatchGenerateRecord]:
+    return db.query(models.BatchGenerateRecord).filter(
+        models.BatchGenerateRecord.id == batch_id
+    ).first()
+
+
+# ============== Template Import/Export ==============
+
+def export_templates(
+    db: Session,
+    template_ids: Optional[List[int]] = None,
+    user_id: Optional[int] = None,
+) -> List[dict]:
+    q = db.query(models.WindowTemplate)
+    if template_ids:
+        q = q.filter(models.WindowTemplate.id.in_(template_ids))
+    if user_id:
+        q = q.filter(models.WindowTemplate.creator_id == user_id)
+    
+    templates = q.all()
+    result = []
+    
+    for tpl in templates:
+        env = tpl.environment
+        creator = tpl.creator
+        result.append({
+            "name": tpl.name,
+            "description": tpl.description,
+            "environment_name": env.name if env else None,
+            "start_time": tpl.start_time,
+            "end_time": tpl.end_time,
+            "change_reason": tpl.change_reason,
+            "is_shared": tpl.is_shared,
+            "creator_username": creator.username if creator else None,
+            "created_at": tpl.created_at.isoformat() if tpl.created_at else None,
+        })
+    
+    return result
+
+
+def import_templates(
+    db: Session, req: schemas.TemplateImportRequest
+) -> schemas.TemplateImportResult:
+    operator = get_user(db, req.operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
+    
+    total = len(req.templates)
+    success = 0
+    skipped = 0
+    failed = 0
+    details = []
+    
+    for idx, item in enumerate(req.templates):
+        try:
+            env = get_environment_by_name(db, item.environment_name)
+            if not env:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "name": item.name,
+                    "status": "failed",
+                    "reason": f"环境 '{item.environment_name}' 不存在",
+                })
+                continue
+            
+            existing = db.query(models.WindowTemplate).filter(
+                models.WindowTemplate.name == item.name,
+                models.WindowTemplate.creator_id == req.operator_id,
+            ).first()
+            
+            if existing:
+                if req.on_conflict == "skip":
+                    skipped += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "skipped",
+                        "reason": "同名模板已存在，跳过",
+                    })
+                    continue
+                elif req.on_conflict == "overwrite":
+                    tpl_in = schemas.WindowTemplateUpdate(
+                        description=item.description,
+                        environment_id=env.id,
+                        start_time=item.start_time,
+                        end_time=item.end_time,
+                        change_reason=item.change_reason,
+                        is_shared=item.is_shared,
+                    )
+                    update_window_template(db, existing.id, tpl_in, req.operator_id)
+                    success += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "overwritten",
+                        "id": existing.id,
+                    })
+                    continue
+                else:
+                    failed += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "failed",
+                        "reason": "同名模板已存在",
+                    })
+                    continue
+            
+            tpl_create = schemas.WindowTemplateCreate(
+                name=item.name,
+                description=item.description,
+                environment_id=env.id,
+                start_time=item.start_time,
+                end_time=item.end_time,
+                change_reason=item.change_reason,
+                is_shared=item.is_shared,
+                creator_id=req.operator_id,
+            )
+            tpl = create_window_template(db, tpl_create)
+            success += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "created",
+                "id": tpl.id,
+            })
+            
+            _add_template_audit_log(
+                db, tpl, TemplateAction.TEMPLATE_IMPORT, req.operator_id,
+                detail=f"导入模板: {item.name}",
+            )
+            
+        except BusinessError as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": e.message,
+            })
+        except Exception as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": str(e),
+            })
+    
+    return schemas.TemplateImportResult(
+        total=total,
+        success=success,
+        skipped=skipped,
+        failed=failed,
+        details=details,
+    )

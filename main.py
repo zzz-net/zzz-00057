@@ -216,6 +216,133 @@ def export_window(win_id: int, db: Session = Depends(get_db)):
     }
 
 
+# ========== Window Templates ==========
+
+@app.post("/window-templates", response_model=schemas.WindowTemplate, tags=["窗口模板"])
+def create_window_template(tpl_in: schemas.WindowTemplateCreate, db: Session = Depends(get_db)):
+    return services.create_window_template(db, tpl_in)
+
+
+@app.get("/window-templates", response_model=List[schemas.WindowTemplate], tags=["窗口模板"])
+def list_window_templates(
+    user_id: Optional[int] = Query(None, description="用户ID（只看自己的和共享的）"),
+    environment_id: Optional[int] = Query(None),
+    is_shared: Optional[int] = Query(None, ge=0, le=1),
+    db: Session = Depends(get_db),
+):
+    return services.list_window_templates(db, user_id, environment_id, is_shared)
+
+
+@app.get("/window-templates/{tpl_id}", response_model=schemas.WindowTemplateDetail, tags=["窗口模板"])
+def get_window_template(tpl_id: int, db: Session = Depends(get_db)):
+    tpl = services.get_window_template(db, tpl_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return tpl
+
+
+@app.put("/window-templates/{tpl_id}", response_model=schemas.WindowTemplate, tags=["窗口模板"])
+def update_window_template(
+    tpl_id: int,
+    tpl_in: schemas.WindowTemplateUpdate,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.update_window_template(db, tpl_id, tpl_in, operator_id)
+
+
+@app.delete("/window-templates/{tpl_id}", tags=["窗口模板"])
+def delete_window_template(
+    tpl_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    services.delete_window_template(db, tpl_id, operator_id)
+    return {"detail": "删除成功"}
+
+
+@app.post("/window-templates/batch-generate", response_model=schemas.BatchGenerateResult, tags=["窗口模板"])
+def batch_generate_windows(
+    req: schemas.BatchGenerateRequest,
+    db: Session = Depends(get_db),
+):
+    return services.batch_generate_windows(db, req)
+
+
+@app.post("/batch-records/{batch_id}/confirm", response_model=schemas.BatchGenerateResult, tags=["批量生成"])
+def confirm_batch_generate(
+    batch_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.confirm_batch_generate(db, batch_id, operator_id)
+
+
+@app.get("/batch-records", response_model=List[schemas.BatchGenerateRecord], tags=["批量生成"])
+def list_batch_records(
+    template_id: Optional[int] = Query(None),
+    creator_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return services.list_batch_records(db, template_id, creator_id)
+
+
+@app.get("/batch-records/{batch_id}", tags=["批量生成"])
+def get_batch_record(batch_id: int, db: Session = Depends(get_db)):
+    record = services.get_batch_record(db, batch_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="批量生成记录不存在")
+    precheck = []
+    if record.precheck_result:
+        precheck = json.loads(record.precheck_result)
+    return {
+        "id": record.id,
+        "template_id": record.template_id,
+        "template_name": record.template_name,
+        "creator_id": record.creator_id,
+        "environment_id": record.environment_id,
+        "generate_mode": record.generate_mode,
+        "date_from": record.date_from.isoformat() if record.date_from else None,
+        "date_to": record.date_to.isoformat() if record.date_to else None,
+        "total_count": record.total_count,
+        "success_count": record.success_count,
+        "skip_count": record.skip_count,
+        "fail_count": record.fail_count,
+        "status": record.status,
+        "precheck_items": precheck,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+# ========== Template Import/Export ==========
+
+@app.post("/window-templates/import", response_model=schemas.TemplateImportResult, tags=["模板导入导出"])
+def import_templates(req: schemas.TemplateImportRequest, db: Session = Depends(get_db)):
+    return services.import_templates(db, req)
+
+
+@app.post("/window-templates/export", tags=["模板导入导出"])
+def export_templates(
+    template_ids: Optional[List[int]] = Query(None),
+    user_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    data = services.export_templates(db, template_ids, user_id)
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    file_path = os.path.join(export_dir, f"templates_{ts}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return {
+        "detail": "导出成功",
+        "file_path": file_path,
+        "storage_location": "system_tempdir_outside_repo",
+        "count": len(data),
+        "data": data,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

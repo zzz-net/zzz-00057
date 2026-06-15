@@ -117,3 +117,79 @@ class AuditLog(Base):
 
     window = relationship("MaintenanceWindow", back_populates="audit_logs")
     operator = relationship("User", foreign_keys=[operator_id])
+
+
+class TemplateAction(str, enum.Enum):
+    TEMPLATE_CREATE = "TEMPLATE_CREATE"
+    TEMPLATE_UPDATE = "TEMPLATE_UPDATE"
+    TEMPLATE_DELETE = "TEMPLATE_DELETE"
+    TEMPLATE_SHARE = "TEMPLATE_SHARE"
+    TEMPLATE_UNSHARE = "TEMPLATE_UNSHARE"
+    BATCH_GENERATE = "BATCH_GENERATE"
+    TEMPLATE_IMPORT = "TEMPLATE_IMPORT"
+    TEMPLATE_EXPORT = "TEMPLATE_EXPORT"
+
+
+class WindowTemplate(Base):
+    __tablename__ = "window_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    environment_id = Column(Integer, ForeignKey("environments.id"), nullable=False)
+    start_time = Column(String(5), nullable=False)
+    end_time = Column(String(5), nullable=False)
+    change_reason = Column(Text, nullable=True)
+    is_shared = Column(Integer, default=0, nullable=False)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    environment = relationship("Environment")
+    creator = relationship("User", foreign_keys=[creator_id])
+    audit_logs = relationship("TemplateAuditLog", back_populates="template", cascade="all, delete-orphan")
+
+
+class TemplateAuditLog(Base):
+    __tablename__ = "template_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(Integer, ForeignKey("window_templates.id"), nullable=False)
+    action = Column(Enum(TemplateAction), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    detail = Column(Text, nullable=True)
+    snapshot = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    template = relationship("WindowTemplate", back_populates="audit_logs")
+    operator = relationship("User", foreign_keys=[operator_id])
+
+
+class ConflictType(str, enum.Enum):
+    OK = "OK"
+    TIME_OVERLAP = "TIME_OVERLAP"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+
+
+class BatchGenerateRecord(Base):
+    __tablename__ = "batch_generate_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(Integer, ForeignKey("window_templates.id"), nullable=True)
+    template_name = Column(String(200), nullable=True)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    environment_id = Column(Integer, ForeignKey("environments.id"), nullable=False)
+    generate_mode = Column(String(20), nullable=False)
+    date_from = Column(DateTime, nullable=True)
+    date_to = Column(DateTime, nullable=True)
+    total_count = Column(Integer, default=0)
+    success_count = Column(Integer, default=0)
+    skip_count = Column(Integer, default=0)
+    fail_count = Column(Integer, default=0)
+    precheck_result = Column(Text, nullable=True)
+    status = Column(String(20), default="PRECHECKED")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[creator_id])
+    environment = relationship("Environment")
+    template = relationship("WindowTemplate")
