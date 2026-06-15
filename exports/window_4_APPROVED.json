@@ -1,0 +1,182 @@
+{
+  "window_id": 4,
+  "title": "D-主流程+回滚验证",
+  "description": "重启一致性核心验证对象",
+  "status": "APPROVED",
+  "environment": {
+    "id": 2,
+    "name": "test",
+    "description": "测试环境-回归"
+  },
+  "time_range": {
+    "start_time": "2026-07-25T14:00:00",
+    "end_time": "2026-07-25T16:00:00"
+  },
+  "creator": {
+    "id": 2,
+    "username": "dev.zhou",
+    "display_name": "ZhouDeveloper"
+  },
+  "approver": {
+    "id": 1,
+    "username": "mgr.qian",
+    "display_name": "QianManager"
+  },
+  "approval_reason": "审批通过-正式变更",
+  "change_reason": "CVE正式变更",
+  "rollback_note": "上线后业务异常, 回滚",
+  "created_at": "2026-06-15T18:24:18.743038",
+  "updated_at": "2026-06-15T18:24:18.934409",
+  "audit_logs": [
+    {
+      "id": 8,
+      "action": "CREATE",
+      "operator_id": 2,
+      "operator_name": "ZhouDeveloper",
+      "operator_username": "dev.zhou",
+      "from_status": null,
+      "to_status": "DRAFT",
+      "reason": "CVE正式变更",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "DRAFT",
+        "creator_id": 2,
+        "approver_id": null,
+        "approval_reason": null,
+        "change_reason": "CVE正式变更",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T18:24:18.745004"
+    },
+    {
+      "id": 9,
+      "action": "SUBMIT",
+      "operator_id": 2,
+      "operator_name": "ZhouDeveloper",
+      "operator_username": "dev.zhou",
+      "from_status": "DRAFT",
+      "to_status": "SUBMITTED",
+      "reason": "准备完毕",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "SUBMITTED",
+        "creator_id": 2,
+        "approver_id": null,
+        "approval_reason": null,
+        "change_reason": "CVE正式变更",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T18:24:18.780733"
+    },
+    {
+      "id": 10,
+      "action": "APPROVE",
+      "operator_id": 1,
+      "operator_name": "QianManager",
+      "operator_username": "mgr.qian",
+      "from_status": "SUBMITTED",
+      "to_status": "APPROVED",
+      "reason": "审批通过-正式变更",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "APPROVED",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "审批通过-正式变更",
+        "change_reason": "CVE正式变更",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T18:24:18.819914"
+    },
+    {
+      "id": 11,
+      "action": "START",
+      "operator_id": 2,
+      "operator_name": "ZhouDeveloper",
+      "operator_username": "dev.zhou",
+      "from_status": "APPROVED",
+      "to_status": "IN_PROGRESS",
+      "reason": "开始执行维护",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "IN_PROGRESS",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "审批通过-正式变更",
+        "change_reason": "CVE正式变更",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T18:24:18.858243"
+    },
+    {
+      "id": 12,
+      "action": "COMPLETE",
+      "operator_id": 2,
+      "operator_name": "ZhouDeveloper",
+      "operator_username": "dev.zhou",
+      "from_status": "IN_PROGRESS",
+      "to_status": "COMPLETED",
+      "reason": "维护完成",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "COMPLETED",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "审批通过-正式变更",
+        "change_reason": "CVE正式变更",
+        "rollback_note": null
+      },
+      "created_at": "2026-06-15T18:24:18.903229"
+    },
+    {
+      "id": 13,
+      "action": "ROLLBACK",
+      "operator_id": 1,
+      "operator_name": "QianManager",
+      "operator_username": "mgr.qian",
+      "from_status": "COMPLETED",
+      "to_status": "APPROVED",
+      "reason": "上线后业务异常, 回滚",
+      "snapshot": {
+        "id": 4,
+        "title": "D-主流程+回滚验证",
+        "description": "重启一致性核心验证对象",
+        "environment_id": 2,
+        "start_time": "2026-07-25T14:00:00",
+        "end_time": "2026-07-25T16:00:00",
+        "status": "APPROVED",
+        "creator_id": 2,
+        "approver_id": 1,
+        "approval_reason": "审批通过-正式变更",
+        "change_reason": "CVE正式变更",
+        "rollback_note": "上线后业务异常, 回滚"
+      },
+      "created_at": "2026-06-15T18:24:18.937363"
+    }
+  ]
+}

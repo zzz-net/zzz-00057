@@ -328,11 +328,6 @@ def submit_window(db: Session, win_id: int, req: schemas.SubmitRequest) -> model
 
     _validate_time_range(db_win.start_time, db_win.end_time)
 
-    overlaps = check_time_overlap(db, db_win.environment_id, db_win.start_time, db_win.end_time, exclude_window_id=win_id)
-    if overlaps:
-        titles = ", ".join([w.title for w in overlaps])
-        raise BusinessError(f"同一环境下存在重叠的已审批/待审批窗口: {titles}")
-
     old_status = db_win.status
     db_win.status = WindowStatus.SUBMITTED
     db_win.updated_at = datetime.utcnow()
@@ -466,14 +461,24 @@ def rollback_window(db: Session, win_id: int, req: schemas.RollbackRequest) -> m
     if not operator:
         raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
 
+    _ROLLBACK_TARGET = {
+        WindowStatus.COMPLETED: WindowStatus.APPROVED,
+        WindowStatus.IN_PROGRESS: WindowStatus.APPROVED,
+        WindowStatus.APPROVED: WindowStatus.SUBMITTED,
+    }
     old_status = db_win.status
-    db_win.status = WindowStatus.ROLLED_BACK
+    target_status = _ROLLBACK_TARGET[old_status]
+
+    db_win.status = target_status
     db_win.rollback_note = req.reason
     db_win.updated_at = datetime.utcnow()
+    if target_status != WindowStatus.APPROVED:
+        db_win.approver_id = None
+        db_win.approval_reason = None
 
     _add_audit_log(
         db, db_win, AuditAction.ROLLBACK, req.operator_id,
-        from_status=old_status, to_status=WindowStatus.ROLLED_BACK,
+        from_status=old_status, to_status=target_status,
         reason=req.reason or "执行回滚",
     )
     db.commit()
