@@ -26,6 +26,9 @@ coverage/
 tmp/
 temp/
 
+# 维护窗口导出产物（原放在仓库根下，现已改到系统临时目录，仅为历史残留兜底）
+exports/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import json
 import os
+import tempfile
+from datetime import datetime
 
 from app.database import engine, Base, get_db, DB_PATH
 from app import models, schemas, services
@@ -200,14 +202,16 @@ def rollback_window(win_id: int, req: schemas.RollbackRequest, db: Session = Dep
 @app.get("/maintenance-windows/{win_id}/export", tags=["导出"])
 def export_window(win_id: int, db: Session = Depends(get_db)):
     data = services.export_window_records(db, win_id)
-    export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports")
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
     os.makedirs(export_dir, exist_ok=True)
-    file_path = os.path.join(export_dir, f"window_{win_id}_{data['status']}.json")
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    file_path = os.path.join(export_dir, f"window_{win_id}_{data['status']}_{ts}.json")
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return {
         "detail": "导出成功",
         "file_path": file_path,
+        "storage_location": "system_tempdir_outside_repo",
         "data": data,
     }
 

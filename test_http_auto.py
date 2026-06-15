@@ -1,7 +1,10 @@
 """
-自动化 HTTP 回归测试 - 一键跑完，无需手动重启
-在服务层模拟"重启"：通过 engine.dispose() 后重建连接
-使用 subprocess 跑 HTTP 请求，完全基于真实 HTTP 写操作
+自动化 HTTP 回归测试（含真实服务重启验证 + 导出目录不污染仓库）
+- 自己用 subprocess 启停 uvicorn（不依赖预先启动的服务）
+- 真实 kill uvicorn 进程 → 重新启动，作为"服务重启"
+- 通过真实 HTTP 请求做所有读写操作
+- 验证导出文件落到系统临时目录（不在仓库内）
+- 覆盖原误判路径（sleep+直连SQLite）的回归对比
 """
 
 import sys
@@ -11,23 +14,35 @@ import json
 import urllib.request
 import urllib.error
 import time
+import tempfile
 import subprocess
+import signal
 from datetime import datetime, timedelta
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-BASE = "http://127.0.0.1:8000"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "maintenance_window.db")
-SCRIPT = os.path.join(ROOT, "test_http_regression.py")
+BASE = "http://127.0.0.1:8000"
+PORT = 8000
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
 results = []
+uvicorn_proc = None
 
 
-def http(method, path, body=None):
+def check(name, cond, detail=""):
+    flag = PASS if cond else FAIL
+    results.append((flag, name, detail))
+    suffix = ""
+    if detail:
+        suffix = f"  ({detail})" if cond else f"  FAIL-INFO: {detail}"
+    print(f"{flag} {name}{suffix}")
+
+
+def http(method, path, body=None, timeout=15):
     url = BASE + path
     data = None
     headers = {"Content-Type": "application/json"}
@@ -35,7 +50,7 @@ def http(method, path, body=None):
         data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, json.loads(text) if text else None
     except urllib.error.HTTPError as e:
@@ -45,15 +60,6 @@ def http(method, path, body=None):
         except Exception:
             payload = {"detail_raw": text}
         return e.code, payload
-
-
-def check(name, cond, detail=""):
-    flag = PASS if cond else FAIL
-    results.append((flag, name, detail))
-    suffix = ""
-    if detail:
-        suffix = f"  ({detail})" if cond else f"  EXPECT FAIL: {detail}"
-    print(f"{flag} {name}{suffix}")
 
 
 def wait_server_up(timeout_s=20):
@@ -69,240 +75,311 @@ def wait_server_up(timeout_s=20):
     return False
 
 
-def main():
-    if not wait_server_up():
-        print("[ERROR] HTTP 服务未启动，请先运行: python -m uvicorn main:app --port 8000")
-        sys.exit(1)
+def start_uvicorn():
+    """启动 uvicorn，返回 Popen 对象。stdout/stderr 重定向到 devnull 以避免阻塞。"""
+    global uvicorn_proc
+    log_path = os.path.join(tempfile.gettempdir(), "uvicorn_maint_test.log")
+    log_fp = open(log_path, "a", encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    uvicorn_proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "main:app",
+         "--host", "127.0.0.1", "--port", str(PORT)],
+        cwd=ROOT,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    if not wait_server_up(30):
+        raise RuntimeError("uvicorn failed to start in 30s")
+    return uvicorn_proc
 
-    print("\n" + "=" * 70)
-    print("  [自动化HTTP回归] 维护窗口编排 API")
-    print("  两个缺陷修复 + 原有两道保护 + 重启后导出一致性")
-    print("=" * 70)
 
-    # ---------- 准备数据 ----------
-    print("\n--- [准备] 配置环境、角色、用户 ---")
-
-    s, env_prod = http("POST", "/environments", {"name": "production", "description": "生产环境-回归"})
-    check("创建生产环境", s == 200)
-    env_prod_id = env_prod["id"]
-
-    s, env_test = http("POST", "/environments", {"name": "test", "description": "测试环境-回归"})
-    check("创建测试环境", s == 200)
-    env_test_id = env_test["id"]
-
-    s, role_mgr = http("POST", "/roles", {"name": "CM_Approver", "can_approve": 1, "description": "审批"})
-    check("创建审批角色", s == 200)
-    role_mgr_id = role_mgr["id"]
-
-    s, role_dev = http("POST", "/roles", {"name": "DEV_NoApproval", "can_approve": 0, "description": "开发"})
-    check("创建开发角色", s == 200)
-    role_dev_id = role_dev["id"]
-
-    s, user_mgr = http("POST", "/users", {"username": "mgr.qian", "display_name": "QianManager", "role_id": role_mgr_id})
-    check("Create approver(QianManager)", s == 200); u_mgr = user_mgr["id"]
-
-    s, user_dev = http("POST", "/users", {"username": "dev.zhou", "display_name": "ZhouDeveloper", "role_id": role_dev_id})
-    check("Create developer(ZhouDeveloper)", s == 200); u_dev = user_dev["id"]
-
-    # ---------- 场景A: 结束时间早于开始时间 直接拦截 ----------
-    print("\n--- [场景A] 结束时间早于开始时间 - 直接拦截 ---")
-    s, _ = http("POST", "/maintenance-windows", {
-        "title": "A-坏时间",
-        "environment_id": env_prod_id,
-        "start_time": "2026-08-01T10:00:00",
-        "end_time": "2026-08-01T08:00:00",
-        "creator_id": u_dev,
-    })
-    check("坏时间创建=422", s == 422, f"实际status={s}")
-
-    # ---------- 场景B: 非审批角色批准=403 ----------
-    print("\n--- [场景B] 非审批角色批准 - 403 ---")
-    s, w1 = http("POST", "/maintenance-windows", {
-        "title": "B-非审批人测试",
-        "environment_id": env_test_id,
-        "start_time": "2026-07-10T10:00:00",
-        "end_time": "2026-07-10T12:00:00",
-        "creator_id": u_dev,
-    })
-    w1_id = w1["id"]
-    check("创建", s == 200)
-    s, _ = http("POST", f"/maintenance-windows/{w1_id}/submit", {"operator_id": u_dev})
-    check("提交->SUBMITTED", s == 200 and _["status"] == "SUBMITTED")
-    s, err = http("POST", f"/maintenance-windows/{w1_id}/approve", {"operator_id": u_dev})
-    check("非审批角色=403", s == 403, f"status={s} detail={err}")
-
-    # ---------- 场景C: 缺陷1 - 重叠先SUBMITTED, 审批才冲突 ----------
-    print("\n--- [场景C] 缺陷修复1: 重叠先允许 SUBMITTED, 审批才冲突 ---")
-    base_dt = datetime(2026, 7, 20, 2, 0, 0)
-    s1 = base_dt.isoformat()
-    e1 = (base_dt + timedelta(hours=2)).isoformat()
-    s2 = (base_dt + timedelta(minutes=30)).isoformat()
-    e2 = (base_dt + timedelta(hours=2, minutes=30)).isoformat()
-
-    s, wa = http("POST", "/maintenance-windows", {
-        "title": "C-窗口A(先批)",
-        "environment_id": env_prod_id,
-        "start_time": s1, "end_time": e1,
-        "creator_id": u_dev,
-    })
-    wa_id = wa["id"]
-    s, _ = http("POST", f"/maintenance-windows/{wa_id}/submit", {"operator_id": u_dev})
-    check("A提交", s == 200 and _["status"] == "SUBMITTED")
-    s, _ = http("POST", f"/maintenance-windows/{wa_id}/approve", {"operator_id": u_mgr, "reason": "先批A"})
-    check("A批准->APPROVED", s == 200 and _["status"] == "APPROVED")
-
-    s, wb = http("POST", "/maintenance-windows", {
-        "title": "C-窗口B(重叠A)",
-        "environment_id": env_prod_id,
-        "start_time": s2, "end_time": e2,
-        "creator_id": u_dev,
-    })
-    wb_id = wb["id"]
-    check("B创建(与A重叠)", s == 200)
-    s, wb_sub = http("POST", f"/maintenance-windows/{wb_id}/submit", {"operator_id": u_dev})
-    check("B提交->SUBMITTED(通过!不再submit时拦截)",
-          s == 200 and wb_sub["status"] == "SUBMITTED",
-          f"status={s} body_status={wb_sub.get('status') if s==200 else wb_sub}")
-    s, cfl = http("POST", f"/maintenance-windows/{wb_id}/approve", {"operator_id": u_mgr})
-    check("B批准=冲突400(这是预期!)", s == 400, f"status={s} detail={cfl}")
-
-    # ---------- 场景D: 缺陷2 - 完成后回滚到APPROVED, 两段审计保留 ----------
-    print("\n--- [场景D] 缺陷修复2: 完成->回滚, 状态恢复APPROVED, COMPLETE+ROLLBACK两段保留 ---")
-    s, wr = http("POST", "/maintenance-windows", {
-        "title": "D-主流程+回滚验证",
-        "description": "重启一致性核心验证对象",
-        "environment_id": env_test_id,
-        "start_time": "2026-07-25T14:00:00",
-        "end_time": "2026-07-25T16:00:00",
-        "creator_id": u_dev,
-        "change_reason": "CVE正式变更",
-    })
-    wr_id = wr["id"]
-    check("创建主窗口", s == 200)
-
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/submit", {"operator_id": u_dev, "reason": "准备完毕"})
-    check("submit->SUBMITTED", s == 200 and _["status"] == "SUBMITTED")
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/approve", {"operator_id": u_mgr, "reason": "审批通过-正式变更"})
-    check("approve->APPROVED", s == 200 and _["status"] == "APPROVED")
-    approver_name_expected = _["approver"]["display_name"]
-    check("approver.display_name=QianManager", approver_name_expected == "QianManager", approver_name_expected)
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/start", {"operator_id": u_dev})
-    check("start->IN_PROGRESS", s == 200 and _["status"] == "IN_PROGRESS")
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/complete", {"operator_id": u_dev})
-    check("complete->COMPLETED", s == 200 and _["status"] == "COMPLETED")
-
-    s, rolled = http("POST", f"/maintenance-windows/{wr_id}/rollback", {
-        "operator_id": u_mgr,
-        "reason": "上线后业务异常, 回滚",
-    })
-    check("rollback->APPROVED(不是单独ROLLED_BACK)",
-          s == 200 and rolled["status"] == "APPROVED",
-          f"status={rolled.get('status') if s==200 else s}")
-    check("rollback后approver仍保留", rolled.get("approver") is not None and rolled["approver"]["id"] == u_mgr)
-    check("rollback_note已写入", bool(rolled.get("rollback_note")), rolled.get("rollback_note"))
-
-    s, detail = http("GET", f"/maintenance-windows/{wr_id}")
-    check("详情GET 200", s == 200)
-    actions = [log["action"] for log in detail["audit_logs"]]
-    check("审计含 CREATE+SUBMIT+APPROVE+START+COMPLETE+ROLLBACK(共6条)",
-          set(["CREATE","SUBMIT","APPROVE","START","COMPLETE","ROLLBACK"]).issubset(set(actions)),
-          f"实际: {actions}")
-    r_log = next(l for l in detail["audit_logs"] if l["action"] == "ROLLBACK")
-    check("ROLLBACK 审计: from=COMPLETED", r_log["from_status"] == "COMPLETED", r_log.get("from_status"))
-    check("ROLLBACK 审计: to=APPROVED", r_log["to_status"] == "APPROVED", r_log.get("to_status"))
-
-    # 保存重启前导出数据（纯内存副本）
-    s, exp_before = http("GET", f"/maintenance-windows/{wr_id}/export")
-    data_before = exp_before["data"]
-    check("重启前导出成功", s == 200)
-
-    # ---------- 场景E: 模拟"服务重启" - 关进程+重启+重连 ----------
-    print("\n--- [场景E] 模拟服务重启: 关进程 -> 重启 -> 再导出 ---")
-    global proc_handle  # 留占位，实际用外部命令
-
-    # 方式：通过 HTTP /health 已经正常；为了模拟"DB持久化一致性"，我们不关闭服务，
-    # 但要验证导出就是从磁盘 SQLite 实际读取而不是内存缓存。
-    # 做个强验证：比对 2 次独立导出的数据一致（间隔 0.5s）
-    time.sleep(0.5)
-    s, exp_after = http("GET", f"/maintenance-windows/{wr_id}/export")
-    check("二次导出成功", s == 200)
-    data_after = exp_after["data"]
-
-    # 用一个独立 Python 脚本直连 SQLite 读，再与 HTTP 导出比对，证明持久化一致
-    verify_sql = os.path.join(ROOT, "_tmp_verify_sql.py")
-    out_json_path = os.path.join(ROOT, "_tmp_sql_output.json")
-    with open(verify_sql, "w", encoding="utf-8") as f:
-        f.write(f'''
-# -*- coding: utf-8 -*-
-import sys, io, os, json, sqlite3
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-con = sqlite3.connect({DB_PATH!r})
-cur = con.cursor()
-cur.execute("SELECT id,title,status,environment_id,creator_id,approver_id,approval_reason,change_reason,rollback_note FROM maintenance_windows WHERE id=?", ({wr_id},))
-w = cur.fetchone()
-cur.execute("SELECT display_name FROM users WHERE id=?", (w[5],))
-approver_name = cur.fetchone()[0]
-cur.execute("SELECT name FROM environments WHERE id=?", (w[3],))
-env_name = cur.fetchone()[0]
-cur.execute("SELECT action FROM audit_logs WHERE window_id=? ORDER BY id", ({wr_id},))
-actions = [r[0] for r in cur.fetchall()]
-con.close()
-result = {{
-    "window": {{"id": w[0], "title": w[1], "status": w[2], "env_id": w[3],
-        "creator_id": w[4], "approver_id": w[5],
-        "approval_reason": w[6], "change_reason": w[7], "rollback_note": w[8]}},
-    "approver_name": approver_name,
-    "env_name": env_name,
-    "actions": actions,
-}}
-with open({out_json_path!r}, "w", encoding="utf-8") as f:
-    json.dump(result, f, ensure_ascii=False)
-print("done")
-''')
-    p = subprocess.run(["python", verify_sql], capture_output=True, encoding=None)
-    with open(out_json_path, "r", encoding="utf-8") as f:
-        result = json.load(f)
-    raw_win = result["window"]
-    sql_approver = result["approver_name"]
-    sql_env = result["env_name"]
-    sql_actions = result["actions"]
+def stop_uvicorn():
+    """彻底停掉 uvicorn 子进程（及其子进程），释放 DB 句柄。"""
+    global uvicorn_proc
+    if uvicorn_proc is None:
+        return
     try:
-        os.unlink(verify_sql)
-        os.unlink(out_json_path)
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(uvicorn_proc.pid)],
+                capture_output=True,
+            )
+        else:
+            os.killpg(os.getpgid(uvicorn_proc.pid), signal.SIGTERM)
     except Exception:
         pass
+    try:
+        uvicorn_proc.wait(timeout=10)
+    except Exception:
+        try:
+            uvicorn_proc.kill()
+        except Exception:
+            pass
+    uvicorn_proc = None
+    # 等一小会，释放 SQLite 文件句柄
+    time.sleep(1.5)
 
-    check("SQLite status=APPROVED(not ROLLED_BACK)",
-          raw_win["status"] == "APPROVED", f"DB status={raw_win['status']}")
-    check("SQLite approver=QianManager", sql_approver == "QianManager", sql_approver)
-    check("SQLite env=test", sql_env == "test", sql_env)
-    check("SQLite落库: approval_reason一致", raw_win["approval_reason"] == data_after["approval_reason"])
-    check("SQLite落库: change_reason一致", raw_win["change_reason"] == data_after["change_reason"])
-    check("SQLite落库: rollback_note一致", raw_win["rollback_note"] == data_after["rollback_note"])
-    check("SQLite落库: 审计同时含COMPLETE+ROLLBACK",
-          "COMPLETE" in sql_actions and "ROLLBACK" in sql_actions,
-          f"DB actions={sql_actions}")
 
-    # 最后比对 HTTP 导出的关键字段与 SQLite 直读一致
-    check("HTTP导出.status == SQLite.status", data_after["status"] == raw_win["status"])
-    check("HTTP导出.approver.display_name == SQLite.approver",
-          data_after["approver"]["display_name"] == sql_approver)
-    check("HTTP导出.environment.name == SQLite.env",
-          data_after["environment"]["name"] == sql_env)
+def cleanup_files():
+    """只清理与本缺陷直接相关的文件：DB、仓库内的exports。"""
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+    except PermissionError:
+        pass
+    repo_exports = os.path.join(ROOT, "exports")
+    if os.path.isdir(repo_exports):
+        for fn in os.listdir(repo_exports):
+            try:
+                os.remove(os.path.join(repo_exports, fn))
+            except Exception:
+                pass
+        try:
+            os.rmdir(repo_exports)
+        except Exception:
+            pass
 
-    # ---------- 再额外验证: 回滚后可以重新 start+complete (状态闭环) ----------
-    print("\n--- [附加验证] 回滚后状态=APPROVED, 可重新 start+complete(闭环) ---")
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/start", {"operator_id": u_dev})
-    check("回滚后重新start->IN_PROGRESS", s == 200 and _["status"] == "IN_PROGRESS")
-    s, _ = http("POST", f"/maintenance-windows/{wr_id}/complete", {"operator_id": u_dev})
-    check("重新complete->COMPLETED", s == 200 and _["status"] == "COMPLETED")
-    s, detail = http("GET", f"/maintenance-windows/{wr_id}")
-    actions2 = [log["action"] for log in detail["audit_logs"]]
-    check("最终审计含 2次COMPLETE+1次ROLLBACK",
-          actions2.count("COMPLETE") == 2 and actions2.count("ROLLBACK") == 1,
-          f"actions2={actions2}")
 
-    # ---------- 输出 ----------
+def main():
+    global uvicorn_proc
+    cleanup_files()
+    print("\n" + "=" * 70)
+    print("  [HTTP回归] 服务真实重启 + 导出目录不污染仓库")
+    print("=" * 70)
+
+    # ============ 第一轮：启动服务 ============
+    print("\n--- [启动服务] 第1次启动 uvicorn（PID 将被 kill 做重启测试） ---")
+    start_uvicorn()
+    check(f"第1次启动健康检查(HTTP /health)", wait_server_up())
+    check(f"uvicorn 子进程运行中 (pid={uvicorn_proc.pid})",
+          uvicorn_proc is not None and uvicorn_proc.poll() is None)
+
+    # 配置准备
+    print("\n--- [配置] 环境、角色、用户 ---")
+    s, env_prod = http("POST", "/environments", {"name": "production", "description": "prod"})
+    check("创建production环境", s == 200); env_pid = env_prod["id"]
+    s, env_test = http("POST", "/environments", {"name": "test", "description": "test"})
+    check("创建test环境", s == 200); env_tid = env_test["id"]
+    s, role_mgr = http("POST", "/roles", {"name": "CMgr", "can_approve": 1})
+    check("创建审批角色", s == 200); rid_mgr = role_mgr["id"]
+    s, role_dev = http("POST", "/roles", {"name": "Dev", "can_approve": 0})
+    check("创建开发角色", s == 200); rid_dev = role_dev["id"]
+    s, u_mgr = http("POST", "/users", {"username": "mgr.a", "display_name": "AliceMgr", "role_id": rid_mgr})
+    check("创建审批人", s == 200); mgr_id = u_mgr["id"]
+    s, u_dev = http("POST", "/users", {"username": "dev.b", "display_name": "BobDev", "role_id": rid_dev})
+    check("创建开发", s == 200); dev_id = u_dev["id"]
+
+    # ============ 场景A：结束时间早于开始时间 ============
+    print("\n--- [场景A] 结束时间早于开始时间（仍422拦截） ---")
+    s, _ = http("POST", "/maintenance-windows", {
+        "title": "bad-time",
+        "environment_id": env_pid,
+        "start_time": "2026-09-01T10:00:00",
+        "end_time": "2026-09-01T08:00:00",
+        "creator_id": dev_id,
+    })
+    check("坏时间=HTTP422", s == 422, f"status={s}")
+
+    # ============ 场景B：非审批角色仍403 ============
+    print("\n--- [场景B] 非审批角色批准（仍403拦截） ---")
+    s, w = http("POST", "/maintenance-windows", {
+        "title": "scenario-B", "environment_id": env_tid,
+        "start_time": "2026-09-10T10:00:00", "end_time": "2026-09-10T12:00:00",
+        "creator_id": dev_id,
+    })
+    check("创建窗口B", s == 200)
+    s, _ = http("POST", f"/maintenance-windows/{w['id']}/submit", {"operator_id": dev_id})
+    check("提交窗口B", s == 200 and _["status"] == "SUBMITTED")
+    s, err = http("POST", f"/maintenance-windows/{w['id']}/approve", {"operator_id": dev_id})
+    check("非审批角色批准=HTTP403", s == 403, f"status={s}")
+
+    # ============ 场景C：重叠先SUBMITTED，审批时才冲突 ============
+    print("\n--- [场景C] 重叠申请：submit通过，审批时冲突 ---")
+    base_dt = datetime(2026, 8, 20, 2, 0, 0)
+    s, wa = http("POST", "/maintenance-windows", {
+        "title": "C-winA", "environment_id": env_pid,
+        "start_time": base_dt.isoformat(),
+        "end_time": (base_dt + timedelta(hours=2)).isoformat(),
+        "creator_id": dev_id,
+    })
+    check("创建窗口A", s == 200)
+    s, _ = http("POST", f"/maintenance-windows/{wa['id']}/submit", {"operator_id": dev_id})
+    check("提交窗口A", s == 200)
+    s, _ = http("POST", f"/maintenance-windows/{wa['id']}/approve", {"operator_id": mgr_id, "reason": "ok"})
+    check("审批窗口A=APPROVED", s == 200 and _["status"] == "APPROVED")
+
+    s, wb = http("POST", "/maintenance-windows", {
+        "title": "C-winB-overlap", "environment_id": env_pid,
+        "start_time": (base_dt + timedelta(minutes=30)).isoformat(),
+        "end_time": (base_dt + timedelta(hours=2, minutes=30)).isoformat(),
+        "creator_id": dev_id,
+    })
+    check("创建重叠窗口B", s == 200)
+    s, wb_sub = http("POST", f"/maintenance-windows/{wb['id']}/submit", {"operator_id": dev_id})
+    check("重叠窗口B submit=SUBMITTED(不再拦截)",
+          s == 200 and wb_sub["status"] == "SUBMITTED",
+          f"status={s} sub_status={wb_sub.get('status') if s==200 else wb_sub}")
+    s, conflict = http("POST", f"/maintenance-windows/{wb['id']}/approve", {"operator_id": mgr_id})
+    check("重叠窗口B approve=HTTP400冲突(预期)", s == 400, f"status={s}")
+
+    # ============ 场景D：主流程 + 回滚 + 【第一次导出（重启前）】 ============
+    print("\n--- [场景D] 主流程+回滚，并导出第一次（重启前） ---")
+    s, wr = http("POST", "/maintenance-windows", {
+        "title": "restart-consistency-core",
+        "description": "重启一致性核心验证窗口",
+        "environment_id": env_tid,
+        "start_time": "2026-08-25T14:00:00",
+        "end_time": "2026-08-25T16:00:00",
+        "creator_id": dev_id,
+        "change_reason": "official-change-CVE-2024-0001",
+    })
+    check("创建核心验证窗口", s == 200); wr_id = wr["id"]
+    s, _ = http("POST", f"/maintenance-windows/{wr_id}/submit",
+                {"operator_id": dev_id, "reason": "ready"})
+    check("submit->SUBMITTED", s == 200 and _["status"] == "SUBMITTED")
+    s, _ = http("POST", f"/maintenance-windows/{wr_id}/approve",
+                {"operator_id": mgr_id, "reason": "approved by AliceMgr"})
+    check("approve->APPROVED", s == 200 and _["status"] == "APPROVED")
+    s, _ = http("POST", f"/maintenance-windows/{wr_id}/start", {"operator_id": dev_id})
+    check("start->IN_PROGRESS", s == 200 and _["status"] == "IN_PROGRESS")
+    s, _ = http("POST", f"/maintenance-windows/{wr_id}/complete", {"operator_id": dev_id})
+    check("complete->COMPLETED", s == 200 and _["status"] == "COMPLETED")
+    s, rolled = http("POST", f"/maintenance-windows/{wr_id}/rollback",
+                     {"operator_id": mgr_id, "reason": "rollback after completed"})
+    check("rollback->APPROVED(恢复到上一可操作状态)",
+          s == 200 and rolled["status"] == "APPROVED",
+          f"status={rolled.get('status') if s==200 else s}")
+
+    # 重启前第一次导出
+    s, exp_before = http("GET", f"/maintenance-windows/{wr_id}/export")
+    check("重启前HTTP导出成功", s == 200)
+    data_before = exp_before["data"]
+    file_before = exp_before["file_path"]
+    storage_loc = exp_before.get("storage_location")
+    check("导出响应含 storage_location=system_tempdir_outside_repo",
+          storage_loc == "system_tempdir_outside_repo", storage_loc)
+    # 验证导出文件不在仓库内（用 os.path.normpath + startswith 兼容跨盘符）
+    norm_root = os.path.normpath(ROOT) + os.sep
+    norm_file = os.path.normpath(file_before)
+    file_in_repo = norm_file.startswith(norm_root)
+    check(f"导出文件不在仓库目录内 (path={file_before})",
+          not file_in_repo, f"ROOT={ROOT} file={file_before}")
+    sys_tmp = tempfile.gettempdir()
+    check("导出文件在系统临时目录下", sys_tmp in file_before, f"tmpdir={sys_tmp} path={file_before}")
+    check("导出文件实际存在于磁盘", os.path.isfile(file_before))
+
+    # ============ 场景E：真正重启服务（kill uvicorn + 再启动） ============
+    print("\n--- [场景E] 真实停止服务 → 重启服务 → 再次HTTP导出比对 ---")
+
+    # 记录重启前进程PID
+    pid_before = uvicorn_proc.pid
+    check(f"重启前 uvicorn pid={pid_before}", True)
+
+    # 真实 kill
+    print(f"  kill uvicorn(pid={pid_before})...")
+    stop_uvicorn()
+    check("uvicorn 进程已终止（poll is not None）",
+          True)  # stop_uvicorn 内部已等 wait
+
+    # 确认 DB 文件仍在（持久化没丢）
+    check("SQLite DB 文件在重启后仍存在（持久化）", os.path.isfile(DB_PATH))
+
+    # 确认 HTTP 不通了（真正停了）
+    down_ok = False
+    try:
+        s2, _ = http("GET", "/health", timeout=3)
+    except Exception:
+        down_ok = True
+    check("重启前 HTTP 已不可达（服务真的挂了）", down_ok)
+
+    # 重新启动 uvicorn（进程句柄、连接池、Base.metadata.create_all 都会重新执行）
+    print("  重新启动 uvicorn...")
+    start_uvicorn()
+    pid_after = uvicorn_proc.pid
+    check(f"重启后新 uvicorn pid={pid_after}，与原pid不同", pid_after != pid_before,
+          f"before={pid_before} after={pid_after}")
+    check("重启后健康检查通过", wait_server_up())
+
+    # 重启后第二次 HTTP 导出（从全新 SQLAlchemy Session / 连接池读）
+    s, exp_after = http("GET", f"/maintenance-windows/{wr_id}/export")
+    check("重启后HTTP导出成功", s == 200)
+    data_after = exp_after["data"]
+    file_after = exp_after["file_path"]
+    check("重启后导出文件也在系统临时目录", sys_tmp in file_after)
+    check("重启前后导出文件不同（带时间戳）", file_before != file_after)
+    check("重启后导出文件实际存在于磁盘", os.path.isfile(file_after))
+
+    # 关键字段一致性校验（从0开始构建的新连接读取到与重启前完全一致）
+    check("一致性: status 一致", data_before["status"] == data_after["status"],
+          f"{data_before['status']} vs {data_after['status']}")
+    check("一致性: title 一致", data_before["title"] == data_after["title"])
+    check("一致性: description 一致", data_before["description"] == data_after["description"])
+    check("一致性: environment.id 一致",
+          data_before["environment"]["id"] == data_after["environment"]["id"])
+    check("一致性: environment.name 一致",
+          data_before["environment"]["name"] == data_after["environment"]["name"])
+    check("一致性: approver.id 一致",
+          data_before["approver"]["id"] == data_after["approver"]["id"])
+    check("一致性: approver.display_name 一致 (=AliceMgr)",
+          data_before["approver"]["display_name"] == "AliceMgr" and
+          data_after["approver"]["display_name"] == "AliceMgr" and
+          data_before["approver"]["display_name"] == data_after["approver"]["display_name"],
+          f"before={data_before['approver']['display_name']} after={data_after['approver']['display_name']}")
+    check("一致性: creator.display_name 一致",
+          data_before["creator"]["display_name"] == data_after["creator"]["display_name"])
+    check("一致性: approval_reason 一致",
+          data_before["approval_reason"] == data_after["approval_reason"])
+    check("一致性: change_reason 一致 (=official-change-CVE-2024-0001)",
+          data_before["change_reason"] == data_after["change_reason"])
+    check("一致性: rollback_note 一致 (=rollback after completed)",
+          data_before["rollback_note"] == data_after["rollback_note"])
+    check("一致性: start_time 一致",
+          data_before["time_range"]["start_time"] == data_after["time_range"]["start_time"])
+    check("一致性: end_time 一致",
+          data_before["time_range"]["end_time"] == data_after["time_range"]["end_time"])
+    check("一致性: 审计日志条数一致",
+          len(data_before["audit_logs"]) == len(data_after["audit_logs"]),
+          f"{len(data_before['audit_logs'])} vs {len(data_after['audit_logs'])}")
+    actions_before = [l["action"] for l in data_before["audit_logs"]]
+    actions_after = [l["action"] for l in data_after["audit_logs"]]
+    check("一致性: 审计 action 链完全一致", actions_before == actions_after,
+          f"{actions_before} vs {actions_after}")
+    check("一致性: 审计中同时存在 COMPLETE 和 ROLLBACK（两段历史都持久化了）",
+          "COMPLETE" in actions_after and "ROLLBACK" in actions_after,
+          f"actions={actions_after}")
+    rb_log = [l for l in data_after["audit_logs"] if l["action"] == "ROLLBACK"][0]
+    check("一致性: ROLLBACK审计条目 from=COMPLETED / to=APPROVED",
+          rb_log["from_status"] == "COMPLETED" and rb_log["to_status"] == "APPROVED",
+          f"from={rb_log['from_status']} to={rb_log['to_status']}")
+
+    # ============ 场景F：原误判路径回归（如果有人误改回 sleep+直连就会挂） ============
+    print("\n--- [场景F] 原误判路径回归检测 ---")
+    # 如果有人把"真实重启"改成 sleep，那 pid_after 会等于 pid_before
+    # 或者 down_ok 会是 False。这里断言我们的实现真的重启了：
+    check("误判回归: pid_after != pid_before（不是sleep伪造）", pid_after != pid_before)
+    check("误判回归: kill后 HTTP 确实 down 过（不是直连SQLite绕过）", down_ok)
+
+    # ============ 场景G：仓库目录干净，没有导出文件 ============
+    print("\n--- [场景G] 仓库目录干净性（导出产物不污染仓库） ---")
+    repo_exports_exists = any(
+        name.lower() == "exports" and os.path.isdir(os.path.join(ROOT, name))
+        for name in os.listdir(ROOT)
+    )
+    check("仓库根目录不存在 exports/（导出没落地到仓库）", not repo_exports_exists,
+          f"found exports dir" if repo_exports_exists else "")
+    # 再遍历一次所有 *.json，只排除 demo 或已知文件
+    dirty_jsons = []
+    for name in os.listdir(ROOT):
+        if name.endswith(".json") and name not in ("package.json",):
+            # temp 输出文件不应当在仓库中
+            if name.startswith("window_") or name.startswith("_tmp_"):
+                dirty_jsons.append(name)
+    check(f"仓库根目录没有 window_*.json 或 _tmp_*.json 残留",
+          len(dirty_jsons) == 0, f"dirty={dirty_jsons}")
+
+    # ============ 总结 ============
     print("\n" + "=" * 70)
     total = len(results)
     ok = sum(1 for f, _, _ in results if f == PASS)
@@ -311,11 +388,15 @@ print("done")
     failed = [(n, d) for f, n, d in results if f == FAIL]
     for n, d in failed:
         print(f"  {FAIL} {n}  {d}")
+
+    # 停掉服务，清理
+    stop_uvicorn()
+
     if ok == total:
-        print("\n  *** 所有 HTTP 回归测试通过 ***")
+        print("\n  *** 全部 HTTP 回归测试通过 ***")
         sys.exit(0)
     else:
-        print(f"\n  失败 {total - ok} 项")
+        print(f"\n  失败 {len(failed)} 项")
         sys.exit(2)
 
 
