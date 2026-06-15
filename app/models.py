@@ -182,6 +182,7 @@ class BatchGenerateRecord(Base):
     generate_mode = Column(String(20), nullable=False)
     date_from = Column(DateTime, nullable=True)
     date_to = Column(DateTime, nullable=True)
+    specific_dates = Column(Text, nullable=True)
     total_count = Column(Integer, default=0)
     success_count = Column(Integer, default=0)
     skip_count = Column(Integer, default=0)

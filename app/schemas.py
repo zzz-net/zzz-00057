@@ -283,6 +283,7 @@ class BatchGenerateRecord(BaseModel):
     generate_mode: str
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
+    specific_dates: Optional[List[str]] = None
     total_count: int
     success_count: int
     skip_count: int
@@ -294,6 +295,20 @@ class BatchGenerateRecord(BaseModel):
         from_attributes = True
 
 
+class BatchRecordExportItem(BaseModel):
+    generate_mode: str
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    specific_dates: Optional[List[str]] = None
+    total_count: int
+    success_count: int
+    skip_count: int
+    fail_count: int
+    status: str
+    precheck_items: List[PreCheckItem] = []
+    created_at: Optional[str] = None
+
+
 class TemplateImportItem(BaseModel):
     name: str
     description: Optional[str] = None
@@ -302,12 +317,15 @@ class TemplateImportItem(BaseModel):
     end_time: str
     change_reason: Optional[str] = None
     is_shared: int = 0
+    batch_records: Optional[List[BatchRecordExportItem]] = None
 
 
 class TemplateImportRequest(BaseModel):
     templates: List[TemplateImportItem]
     operator_id: int
     on_conflict: str = Field("skip", pattern=r"^(skip|overwrite|error)$")
+    restore_batch_records: bool = False
+    re_generate_on_conflict: bool = False
 
 
 class TemplateImportResult(BaseModel):
@@ -328,3 +346,4 @@ class TemplateExportItem(BaseModel):
     is_shared: int
     creator_username: Optional[str] = None
     created_at: Optional[str] = None
+    batch_records: List[BatchRecordExportItem] = []

@@ -343,6 +343,15 @@ def export_templates(
     }
 
 
+@app.post("/batch-records/{batch_id}/regenerate", response_model=schemas.BatchGenerateResult, tags=["批量生成"])
+def regenerate_from_batch_record(
+    batch_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.regenerate_from_batch_record(db, batch_id, operator_id)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

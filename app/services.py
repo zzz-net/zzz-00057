@@ -853,6 +853,7 @@ def batch_generate_windows(
         generate_mode=req.generate_mode,
         date_from=_combine_datetime(date_from, template.start_time),
         date_to=_combine_datetime(date_to, template.end_time),
+        specific_dates=json.dumps([d.isoformat() for d in dates], ensure_ascii=False),
         total_count=len(dates),
         success_count=0,
         skip_count=0,
@@ -1029,6 +1030,30 @@ def get_batch_record(db: Session, batch_id: int) -> Optional[models.BatchGenerat
 
 # ============== Template Import/Export ==============
 
+def _serialize_batch_record_for_export(batch: models.BatchGenerateRecord) -> dict:
+    precheck_items = []
+    if batch.precheck_result:
+        precheck_items = json.loads(batch.precheck_result)
+    
+    specific_dates = None
+    if batch.specific_dates:
+        specific_dates = json.loads(batch.specific_dates)
+    
+    return {
+        "generate_mode": batch.generate_mode,
+        "date_from": batch.date_from.isoformat() if batch.date_from else None,
+        "date_to": batch.date_to.isoformat() if batch.date_to else None,
+        "specific_dates": specific_dates,
+        "total_count": batch.total_count,
+        "success_count": batch.success_count,
+        "skip_count": batch.skip_count,
+        "fail_count": batch.fail_count,
+        "status": batch.status,
+        "precheck_items": precheck_items,
+        "created_at": batch.created_at.isoformat() if batch.created_at else None,
+    }
+
+
 def export_templates(
     db: Session,
     template_ids: Optional[List[int]] = None,
@@ -1046,6 +1071,13 @@ def export_templates(
     for tpl in templates:
         env = tpl.environment
         creator = tpl.creator
+        
+        batch_records = db.query(models.BatchGenerateRecord).filter(
+            models.BatchGenerateRecord.template_id == tpl.id
+        ).order_by(models.BatchGenerateRecord.created_at.desc()).all()
+        
+        batch_data = [_serialize_batch_record_for_export(b) for b in batch_records]
+        
         result.append({
             "name": tpl.name,
             "description": tpl.description,
@@ -1056,9 +1088,46 @@ def export_templates(
             "is_shared": tpl.is_shared,
             "creator_username": creator.username if creator else None,
             "created_at": tpl.created_at.isoformat() if tpl.created_at else None,
+            "batch_records": batch_data,
         })
     
     return result
+
+
+def _restore_batch_record(
+    db: Session,
+    tpl: models.WindowTemplate,
+    batch_data: dict,
+    operator_id: int,
+) -> models.BatchGenerateRecord:
+    precheck_items_raw = batch_data.get("precheck_items", [])
+    specific_dates_raw = batch_data.get("specific_dates")
+    
+    date_from = None
+    date_to = None
+    if batch_data.get("date_from"):
+        date_from = datetime.fromisoformat(batch_data["date_from"])
+    if batch_data.get("date_to"):
+        date_to = datetime.fromisoformat(batch_data["date_to"])
+    
+    record = models.BatchGenerateRecord(
+        template_id=tpl.id,
+        template_name=tpl.name,
+        creator_id=operator_id,
+        environment_id=tpl.environment_id,
+        generate_mode=batch_data.get("generate_mode", "date_range"),
+        date_from=date_from,
+        date_to=date_to,
+        specific_dates=json.dumps(specific_dates_raw, ensure_ascii=False) if specific_dates_raw else None,
+        total_count=batch_data.get("total_count", 0),
+        success_count=batch_data.get("success_count", 0),
+        skip_count=batch_data.get("skip_count", 0),
+        fail_count=batch_data.get("fail_count", 0),
+        precheck_result=json.dumps(precheck_items_raw, ensure_ascii=False) if precheck_items_raw else None,
+        status=batch_data.get("status", "PRECHECKED"),
+    )
+    db.add(record)
+    return record
 
 
 def import_templates(
@@ -1094,14 +1163,37 @@ def import_templates(
             
             if existing:
                 if req.on_conflict == "skip":
-                    skipped += 1
-                    details.append({
-                        "index": idx,
-                        "name": item.name,
-                        "status": "skipped",
-                        "reason": "同名模板已存在，跳过",
-                    })
-                    continue
+                    if not req.re_generate_on_conflict:
+                        skipped += 1
+                        details.append({
+                            "index": idx,
+                            "name": item.name,
+                            "status": "skipped",
+                            "reason": "同名模板已存在，跳过",
+                        })
+                        continue
+                    else:
+                        if item.batch_records:
+                            for br_data in item.batch_records:
+                                _restore_batch_record(db, existing, br_data.model_dump(), req.operator_id)
+                            success += 1
+                            details.append({
+                                "index": idx,
+                                "name": item.name,
+                                "status": "regenerated",
+                                "template_id": existing.id,
+                                "batch_records_restored": len(item.batch_records),
+                            })
+                            continue
+                        else:
+                            skipped += 1
+                            details.append({
+                                "index": idx,
+                                "name": item.name,
+                                "status": "skipped",
+                                "reason": "同名模板已存在，且无批量记录可再生成",
+                            })
+                            continue
                 elif req.on_conflict == "overwrite":
                     tpl_in = schemas.WindowTemplateUpdate(
                         description=item.description,
@@ -1112,12 +1204,18 @@ def import_templates(
                         is_shared=item.is_shared,
                     )
                     update_window_template(db, existing.id, tpl_in, req.operator_id)
+                    
+                    if req.restore_batch_records and item.batch_records:
+                        for br_data in item.batch_records:
+                            _restore_batch_record(db, existing, br_data.model_dump(), req.operator_id)
+                    
                     success += 1
                     details.append({
                         "index": idx,
                         "name": item.name,
                         "status": "overwritten",
                         "id": existing.id,
+                        "batch_records_restored": len(item.batch_records) if item.batch_records else 0,
                     })
                     continue
                 else:
@@ -1141,17 +1239,23 @@ def import_templates(
                 creator_id=req.operator_id,
             )
             tpl = create_window_template(db, tpl_create)
+            
+            if req.restore_batch_records and item.batch_records:
+                for br_data in item.batch_records:
+                    _restore_batch_record(db, tpl, br_data.model_dump(), req.operator_id)
+            
             success += 1
             details.append({
                 "index": idx,
                 "name": item.name,
                 "status": "created",
                 "id": tpl.id,
+                "batch_records_restored": len(item.batch_records) if item.batch_records else 0,
             })
             
             _add_template_audit_log(
                 db, tpl, TemplateAction.TEMPLATE_IMPORT, req.operator_id,
-                detail=f"导入模板: {item.name}",
+                detail=f"导入模板: {item.name}" + (f"，恢复 {len(item.batch_records)} 条批量记录" if item.batch_records else ""),
             )
             
         except BusinessError as e:
@@ -1171,10 +1275,114 @@ def import_templates(
                 "reason": str(e),
             })
     
+    db.commit()
+    
     return schemas.TemplateImportResult(
         total=total,
         success=success,
         skipped=skipped,
         failed=failed,
         details=details,
+    )
+
+
+def regenerate_from_batch_record(
+    db: Session, batch_id: int, operator_id: int
+) -> schemas.BatchGenerateResult:
+    batch = db.query(models.BatchGenerateRecord).filter(
+        models.BatchGenerateRecord.id == batch_id
+    ).first()
+    if not batch:
+        raise BusinessError(f"批量生成记录 ID={batch_id} 不存在", 404)
+    
+    template = get_window_template(db, batch.template_id) if batch.template_id else None
+    if not template:
+        raise BusinessError("关联模板不存在，无法再生成", 404)
+    
+    _check_template_permission(db, template, operator_id, "use")
+    
+    dates = []
+    if batch.specific_dates:
+        dates = [date.fromisoformat(d) for d in json.loads(batch.specific_dates)]
+    elif batch.date_from and batch.date_to:
+        current = batch.date_from.date()
+        end = batch.date_to.date()
+        while current <= end:
+            dates.append(current)
+            current += timedelta(days=1)
+    
+    if not dates:
+        raise BusinessError("批量记录中没有日期信息，无法再生成")
+    
+    precheck_items = precheck_batch_windows(db, template, dates)
+    
+    new_batch = models.BatchGenerateRecord(
+        template_id=template.id,
+        template_name=template.name,
+        creator_id=operator_id,
+        environment_id=template.environment_id,
+        generate_mode=batch.generate_mode,
+        date_from=batch.date_from,
+        date_to=batch.date_to,
+        specific_dates=batch.specific_dates,
+        total_count=len(dates),
+        success_count=0,
+        skip_count=0,
+        fail_count=0,
+        precheck_result=json.dumps([item.model_dump() for item in precheck_items], ensure_ascii=False),
+        status="PRECHECKED",
+    )
+    db.add(new_batch)
+    db.flush()
+    
+    created_windows = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    for item in precheck_items:
+        if item.conflict_type == ConflictType.OK:
+            try:
+                d = date.fromisoformat(item.date)
+                start_dt = _combine_datetime(d, template.start_time)
+                end_dt = _combine_datetime(d, template.end_time)
+                
+                win = create_maintenance_window(db, schemas.MaintenanceWindowCreate(
+                    title=f"{template.name} - {d.isoformat()}",
+                    description=template.description or "",
+                    environment_id=template.environment_id,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    creator_id=operator_id,
+                    change_reason=template.change_reason or f"再生成自模板: {template.name}",
+                ))
+                created_windows.append(win)
+                success_count += 1
+            except Exception:
+                fail_count += 1
+        else:
+            skip_count += 1
+    
+    new_batch.success_count = success_count
+    new_batch.skip_count = skip_count
+    new_batch.fail_count = fail_count
+    new_batch.status = "COMPLETED"
+    
+    _add_template_audit_log(
+        db, template, TemplateAction.BATCH_GENERATE, operator_id,
+        detail=f"再生成 {len(dates)} 条窗口，成功 {success_count}，跳过 {skip_count}，失败 {fail_count}",
+    )
+    
+    db.commit()
+    db.refresh(new_batch)
+    
+    return schemas.BatchGenerateResult(
+        batch_id=new_batch.id,
+        total_count=len(dates),
+        success_count=success_count,
+        skip_count=skip_count,
+        fail_count=fail_count,
+        status=new_batch.status,
+        precheck_items=precheck_items,
+        created_windows=created_windows,
     )
