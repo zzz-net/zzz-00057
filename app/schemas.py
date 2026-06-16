@@ -3,6 +3,7 @@ from datetime import datetime, date
 import json
 from typing import Optional, List, Any
 from app.models import WindowStatus, AuditAction, TemplateAction, ConflictType
+from app.models import PlanStatus, PlanItemStatus, DiffType, PlanAction
 
 
 class EnvironmentBase(BaseModel):
@@ -364,3 +365,376 @@ class TemplateExportItem(BaseModel):
     creator_username: Optional[str] = None
     created_at: Optional[str] = None
     batch_records: List[BatchRecordExportItem] = []
+
+
+# ============== Schedule Plan Schemas ==============
+
+class DiffHintItem(BaseModel):
+    diff_type: DiffType
+    detail: str
+    old_value: Optional[Any] = None
+    new_value: Optional[Any] = None
+
+
+class PlanItemSnapshot(BaseModel):
+    conflict_type: ConflictType
+    conflict_window_id: Optional[int] = None
+    conflict_window_title: Optional[str] = None
+    conflict_window_status: Optional[str] = None
+    message: Optional[str] = None
+
+
+class SchedulePlanItemBase(BaseModel):
+    date: str
+    start_time: str
+    end_time: str
+
+
+class SchedulePlanItemCreate(SchedulePlanItemBase):
+    precheck_snapshot: PlanItemSnapshot
+
+
+class SchedulePlanItem(SchedulePlanItemBase):
+    id: int
+    plan_id: int
+    status: PlanItemStatus
+    conflict_type_snapshot: Optional[ConflictType] = None
+    conflict_window_id_snapshot: Optional[int] = None
+    conflict_window_title_snapshot: Optional[str] = None
+    conflict_window_status_snapshot: Optional[str] = None
+    message_snapshot: Optional[str] = None
+    current_diff_type: Optional[DiffType] = None
+    current_diff_detail: Optional[str] = None
+    latest_precheck: Optional[PlanItemSnapshot] = None
+    window_id: Optional[int] = None
+    excluded_at: Optional[datetime] = None
+    excluded_by: Optional[int] = None
+    confirmed_at: Optional[datetime] = None
+    confirmed_by: Optional[int] = None
+    diff_hints: List[DiffHintItem] = []
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("latest_precheck", mode="before")
+    @classmethod
+    def _parse_latest_precheck(cls, v: Any) -> Optional[PlanItemSnapshot]:
+        if v is None:
+            return None
+        if isinstance(v, PlanItemSnapshot):
+            return v
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                return PlanItemSnapshot(**data)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if isinstance(v, dict):
+            return PlanItemSnapshot(**v)
+        return None
+
+    class Config:
+        from_attributes = True
+
+
+class SchedulePlanBase(BaseModel):
+    name: str = Field(..., max_length=200)
+    description: Optional[str] = None
+    template_id: int
+    generate_mode: str = Field(..., pattern=r"^(date_range|specific_dates)$")
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    specific_dates: Optional[List[date]] = None
+    operator_remark: Optional[str] = None
+
+
+class SchedulePlanCreate(SchedulePlanBase):
+    creator_id: int
+
+
+class SchedulePlanSubmit(BaseModel):
+    operator_id: int
+    remark: Optional[str] = None
+
+
+class SchedulePlanApprove(BaseModel):
+    operator_id: int
+    reason: Optional[str] = None
+
+
+class SchedulePlanReject(BaseModel):
+    operator_id: int
+    reason: str
+
+
+class SchedulePlanDetectChangeResult(BaseModel):
+    plan_id: int
+    total_items: int
+    changed_items: int
+    unchanged_items: int
+    excluded_items: int
+    details: List[dict]
+
+
+class SchedulePlanRecheckItem(BaseModel):
+    item_id: int
+    operator_id: int
+
+
+class SchedulePlanExcludeItem(BaseModel):
+    item_id: int
+    operator_id: int
+    reason: Optional[str] = None
+
+
+class SchedulePlanConfirm(BaseModel):
+    operator_id: int
+    item_ids: Optional[List[int]] = None
+    remark: Optional[str] = None
+
+
+class SchedulePlanExecute(BaseModel):
+    operator_id: int
+
+
+class SchedulePlan(SchedulePlanBase):
+    id: int
+    status: PlanStatus
+    environment_id: int
+    template_version_snapshot: dict
+    environment_slots_snapshot: List[dict]
+    creator_id: int
+    approver_id: Optional[int] = None
+    approval_reason: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    total_count: int
+    approved_count: int
+    confirmed_count: int
+    created_count: int
+    created_at: datetime
+    updated_at: datetime
+    creator: Optional[User] = None
+    approver: Optional[User] = None
+
+    @field_validator("template_version_snapshot", mode="before")
+    @classmethod
+    def _parse_template_snapshot(cls, v: Any) -> dict:
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    @field_validator("environment_slots_snapshot", mode="before")
+    @classmethod
+    def _parse_slots_snapshot(cls, v: Any) -> List[dict]:
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                if isinstance(data, list):
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
+    @field_validator("specific_dates", mode="before")
+    @classmethod
+    def _parse_specific_dates(cls, v: Any) -> Optional[List[str]]:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
+
+    class Config:
+        from_attributes = True
+
+
+class SchedulePlanDetail(SchedulePlan):
+    items: List[SchedulePlanItem] = []
+
+
+class SchedulePlanListItem(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    template_id: int
+    template_name: Optional[str] = None
+    environment_id: int
+    environment_name: Optional[str] = None
+    status: PlanStatus
+    generate_mode: str
+    total_count: int
+    approved_count: int
+    confirmed_count: int
+    created_count: int
+    creator_id: int
+    creator_name: Optional[str] = None
+    approver_id: Optional[int] = None
+    approver_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PlanConfirmationBase(BaseModel):
+    plan_id: int
+    operator_id: int
+    confirmation_type: str
+    remark: Optional[str] = None
+
+
+class PlanConfirmation(PlanConfirmationBase):
+    id: int
+    item_ids: Optional[List[int]] = None
+    excluded_item_ids: Optional[List[int]] = None
+    rechecked_item_ids: Optional[List[int]] = None
+    diff_summary: Optional[dict] = None
+    operator: Optional[User] = None
+    created_at: datetime
+
+    @field_validator("item_ids", "excluded_item_ids", "rechecked_item_ids", mode="before")
+    @classmethod
+    def _parse_int_list(cls, v: Any) -> Optional[List[int]]:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                if isinstance(data, list):
+                    return [int(x) for x in data]
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
+
+    @field_validator("diff_summary", mode="before")
+    @classmethod
+    def _parse_diff_summary(cls, v: Any) -> Optional[dict]:
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    class Config:
+        from_attributes = True
+
+
+class PlanAuditLogBase(BaseModel):
+    plan_id: int
+    action: PlanAction
+    operator_id: int
+    item_id: Optional[int] = None
+    detail: Optional[str] = None
+
+
+class PlanAuditLog(PlanAuditLogBase):
+    id: int
+    snapshot: Optional[dict] = None
+    operator: Optional[User] = None
+    created_at: datetime
+
+    @field_validator("snapshot", mode="before")
+    @classmethod
+    def _parse_snapshot(cls, v: Any) -> Optional[dict]:
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    class Config:
+        from_attributes = True
+
+
+# ============== Plan Import/Export ==============
+
+class PlanItemExport(BaseModel):
+    date: str
+    start_time: str
+    end_time: str
+    precheck_snapshot: dict
+    conflict_type_snapshot: Optional[str] = None
+    conflict_window_id_snapshot: Optional[int] = None
+    conflict_window_title_snapshot: Optional[str] = None
+    conflict_window_status_snapshot: Optional[str] = None
+    message_snapshot: Optional[str] = None
+    status: str
+
+
+class PlanExportItem(BaseModel):
+    name: str
+    description: Optional[str] = None
+    template_name: str
+    template_version_snapshot: dict
+    environment_name: str
+    environment_slots_snapshot: List[dict]
+    generate_mode: str
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    specific_dates: Optional[List[str]] = None
+    operator_remark: Optional[str] = None
+    status: str
+    approval_reason: Optional[str] = None
+    items: List[PlanItemExport] = []
+    confirmations: List[dict] = []
+    audit_logs: List[dict] = []
+    creator_username: Optional[str] = None
+    approver_username: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class PlanImportItem(BaseModel):
+    name: str
+    description: Optional[str] = None
+    template_name: str
+    template_version_snapshot: dict
+    environment_name: str
+    environment_slots_snapshot: List[dict]
+    generate_mode: str
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    specific_dates: Optional[List[str]] = None
+    operator_remark: Optional[str] = None
+    status: str
+    approval_reason: Optional[str] = None
+    items: List[PlanItemExport] = []
+
+
+class PlanImportRequest(BaseModel):
+    plans: List[PlanImportItem]
+    operator_id: int
+    on_conflict: str = Field("skip", pattern=r"^(skip|overwrite|error)$")
+
+
+class PlanImportResult(BaseModel):
+    total: int
+    success: int
+    skipped: int
+    failed: int
+    details: List[dict]

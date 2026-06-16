@@ -1386,3 +1386,1144 @@ def regenerate_from_batch_record(
         precheck_items=precheck_items,
         created_windows=created_windows,
     )
+
+
+# ============== Schedule Plan Service ==============
+
+def _plan_snapshot(plan: models.SchedulePlan) -> str:
+    return json.dumps({
+        "id": plan.id,
+        "name": plan.name,
+        "description": plan.description,
+        "template_id": plan.template_id,
+        "environment_id": plan.environment_id,
+        "generate_mode": plan.generate_mode,
+        "status": plan.status.value if plan.status else None,
+        "creator_id": plan.creator_id,
+        "total_count": plan.total_count,
+        "approved_count": plan.approved_count,
+        "confirmed_count": plan.confirmed_count,
+    }, ensure_ascii=False)
+
+
+def _add_plan_audit_log(
+    db: Session,
+    plan: models.SchedulePlan,
+    action: models.PlanAction,
+    operator_id: int,
+    item_id: Optional[int] = None,
+    detail: Optional[str] = None,
+):
+    log = models.PlanAuditLog(
+        plan_id=plan.id,
+        action=action,
+        operator_id=operator_id,
+        item_id=item_id,
+        detail=detail,
+        snapshot=_plan_snapshot(plan),
+    )
+    db.add(log)
+
+
+def _snapshot_template(template: models.WindowTemplate) -> str:
+    return json.dumps({
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "environment_id": template.environment_id,
+        "start_time": template.start_time,
+        "end_time": template.end_time,
+        "change_reason": template.change_reason,
+        "is_shared": template.is_shared,
+        "creator_id": template.creator_id,
+        "updated_at": template.updated_at.isoformat() if template.updated_at else None,
+    }, ensure_ascii=False)
+
+
+def _snapshot_environment_slots(db: Session, environment_id: int) -> str:
+    slots = list_maintenance_slots(db, environment_id)
+    return json.dumps([{
+        "id": s.id,
+        "day_of_week": s.day_of_week,
+        "start_time": s.start_time,
+        "end_time": s.end_time,
+    } for s in slots], ensure_ascii=False)
+
+
+def _check_plan_permission(
+    db: Session,
+    plan: models.SchedulePlan,
+    operator_id: int,
+    action: str = "view",
+):
+    operator = get_user(db, operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={operator_id} 不存在", 404)
+    
+    is_owner = plan.creator_id == operator_id
+    is_approver = user_can_approve(db, operator_id)
+    template = plan.template
+    is_shared_template = template and template.is_shared == 1
+    
+    if action == "view":
+        if is_owner or is_approver:
+            return True
+        if is_shared_template:
+            return True
+        raise BusinessError("无权限查看该方案", 403)
+    
+    if action == "submit":
+        if is_owner or is_approver:
+            return True
+        raise BusinessError("只有创建人或审批人可以提交审批", 403)
+    
+    if action == "approve":
+        if not is_approver:
+            raise BusinessError("只有审批角色可以审批方案", 403)
+        return True
+    
+    if action == "confirm":
+        if is_owner:
+            return True
+        if is_approver:
+            return True
+        if is_shared_template:
+            if plan.creator_id != operator_id:
+                raise BusinessError("非审批角色不能替别人确认已共享方案", 403)
+            return True
+        raise BusinessError("无权限确认该方案", 403)
+    
+    if action in ["modify", "exclude", "recheck", "execute", "cancel"]:
+        if is_owner or is_approver:
+            return True
+        raise BusinessError(f"无权限{action_description(action)}该方案", 403)
+    
+    raise BusinessError(f"无权限执行该操作", 403)
+
+
+def create_schedule_plan(
+    db: Session, plan_in: schemas.SchedulePlanCreate
+) -> models.SchedulePlan:
+    template = get_window_template(db, plan_in.template_id)
+    if not template:
+        raise BusinessError(f"模板 ID={plan_in.template_id} 不存在", 404)
+    
+    _check_template_permission(db, template, plan_in.creator_id, "use")
+    
+    creator = get_user(db, plan_in.creator_id)
+    if not creator:
+        raise BusinessError(f"创建人 ID={plan_in.creator_id} 不存在", 404)
+    
+    env = get_environment(db, template.environment_id)
+    if not env:
+        raise BusinessError(f"环境 ID={template.environment_id} 不存在", 404)
+    
+    dates = []
+    if plan_in.generate_mode == "date_range":
+        if not plan_in.date_from or not plan_in.date_to:
+            raise BusinessError("日期范围模式需要提供 date_from 和 date_to")
+        if plan_in.date_to < plan_in.date_from:
+            raise BusinessError("date_to 不能早于 date_from")
+        current = plan_in.date_from
+        while current <= plan_in.date_to:
+            dates.append(current)
+            current += timedelta(days=1)
+    elif plan_in.generate_mode == "specific_dates":
+        if not plan_in.specific_dates or len(plan_in.specific_dates) == 0:
+            raise BusinessError("指定日期模式需要提供 specific_dates")
+        dates = sorted(set(plan_in.specific_dates))
+    else:
+        raise BusinessError(f"不支持的生成模式: {plan_in.generate_mode}")
+    
+    if len(dates) == 0:
+        raise BusinessError("没有可生成的日期")
+    
+    precheck_items = precheck_batch_windows(db, template, dates)
+    
+    plan = models.SchedulePlan(
+        name=plan_in.name,
+        description=plan_in.description,
+        template_id=template.id,
+        template_version_snapshot=_snapshot_template(template),
+        environment_id=template.environment_id,
+        environment_slots_snapshot=_snapshot_environment_slots(db, template.environment_id),
+        generate_mode=plan_in.generate_mode,
+        date_from=_combine_datetime(min(dates), template.start_time) if dates else None,
+        date_to=_combine_datetime(max(dates), template.end_time) if dates else None,
+        specific_dates=json.dumps([d.isoformat() for d in dates], ensure_ascii=False),
+        operator_remark=plan_in.operator_remark,
+        status=models.PlanStatus.DRAFT,
+        creator_id=plan_in.creator_id,
+        total_count=len(dates),
+        approved_count=0,
+        confirmed_count=0,
+        created_count=0,
+    )
+    db.add(plan)
+    db.flush()
+    
+    for item in precheck_items:
+        plan_item = models.SchedulePlanItem(
+            plan_id=plan.id,
+            date=item.date,
+            start_time=item.start_time,
+            end_time=item.end_time,
+            precheck_snapshot=json.dumps(item.model_dump(), ensure_ascii=False),
+            conflict_type_snapshot=item.conflict_type.value if item.conflict_type else None,
+            conflict_window_id_snapshot=item.conflict_window_id,
+            conflict_window_title_snapshot=item.conflict_window_title,
+            conflict_window_status_snapshot=item.conflict_window_status,
+            message_snapshot=item.message,
+            status=models.PlanItemStatus.PENDING,
+        )
+        db.add(plan_item)
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_CREATE, plan_in.creator_id,
+        detail=f"创建方案: {plan_in.name}，共 {len(dates)} 条候选窗口",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def get_schedule_plan(db: Session, plan_id: int) -> Optional[models.SchedulePlan]:
+    return db.query(models.SchedulePlan).filter(models.SchedulePlan.id == plan_id).first()
+
+
+def list_schedule_plans(
+    db: Session,
+    template_id: Optional[int] = None,
+    creator_id: Optional[int] = None,
+    status: Optional[models.PlanStatus] = None,
+) -> List[models.SchedulePlan]:
+    q = db.query(models.SchedulePlan)
+    if template_id is not None:
+        q = q.filter(models.SchedulePlan.template_id == template_id)
+    if creator_id is not None:
+        q = q.filter(models.SchedulePlan.creator_id == creator_id)
+    if status is not None:
+        q = q.filter(models.SchedulePlan.status == status)
+    return q.order_by(models.SchedulePlan.created_at.desc()).all()
+
+
+def submit_schedule_plan(
+    db: Session, plan_id: int, req: schemas.SchedulePlanSubmit
+) -> models.SchedulePlan:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "submit")
+    
+    if plan.status not in [models.PlanStatus.DRAFT, models.PlanStatus.REJECTED]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能提交审批")
+    
+    if plan.total_count == 0:
+        raise BusinessError("方案中没有候选窗口，无法提交审批")
+    
+    old_status = plan.status
+    plan.status = models.PlanStatus.PENDING_APPROVAL
+    plan.updated_at = datetime.utcnow()
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_SUBMIT, req.operator_id,
+        detail=f"提交审批: {req.remark or '无备注'}",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def approve_schedule_plan(
+    db: Session, plan_id: int, req: schemas.SchedulePlanApprove
+) -> models.SchedulePlan:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "approve")
+    
+    if plan.status != models.PlanStatus.PENDING_APPROVAL:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能审批")
+    
+    old_status = plan.status
+    plan.status = models.PlanStatus.APPROVED
+    plan.approver_id = req.operator_id
+    plan.approval_reason = req.reason
+    plan.approved_at = datetime.utcnow()
+    plan.approved_count = plan.total_count
+    plan.updated_at = datetime.utcnow()
+    
+    for item in plan.items:
+        if item.status == models.PlanItemStatus.PENDING:
+            item.status = models.PlanItemStatus.APPROVED
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_APPROVE, req.operator_id,
+        detail=f"审批通过: {req.reason or '无备注'}",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def reject_schedule_plan(
+    db: Session, plan_id: int, req: schemas.SchedulePlanReject
+) -> models.SchedulePlan:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "approve")
+    
+    if plan.status != models.PlanStatus.PENDING_APPROVAL:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能驳回")
+    
+    old_status = plan.status
+    plan.status = models.PlanStatus.REJECTED
+    plan.approver_id = req.operator_id
+    plan.approval_reason = req.reason
+    plan.updated_at = datetime.utcnow()
+    
+    for item in plan.items:
+        if item.status == models.PlanItemStatus.PENDING:
+            item.status = models.PlanItemStatus.PENDING
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_REJECT, req.operator_id,
+        detail=f"审批驳回: {req.reason}",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def detect_plan_changes(
+    db: Session, plan_id: int, operator_id: int
+) -> schemas.SchedulePlanDetectChangeResult:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, operator_id, "view")
+    
+    if plan.status not in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMING]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能检测变更")
+    
+    template = plan.template
+    if not template:
+        raise BusinessError("关联模板不存在", 404)
+    
+    current_template_snapshot = json.loads(_snapshot_template(template))
+    original_template_snapshot = json.loads(plan.template_version_snapshot)
+    
+    current_slots_snapshot = json.loads(_snapshot_environment_slots(db, plan.environment_id))
+    original_slots_snapshot = json.loads(plan.environment_slots_snapshot)
+    
+    template_changed = (
+        current_template_snapshot["start_time"] != original_template_snapshot["start_time"] or
+        current_template_snapshot["end_time"] != original_template_snapshot["end_time"] or
+        current_template_snapshot["environment_id"] != original_template_snapshot["environment_id"]
+    )
+    
+    slots_changed = current_slots_snapshot != original_slots_snapshot
+    
+    changed_count = 0
+    unchanged_count = 0
+    excluded_count = 0
+    details = []
+    
+    for item in plan.items:
+        if item.status == models.PlanItemStatus.EXCLUDED:
+            excluded_count += 1
+            continue
+        
+        diff_hints = []
+        current_diff_type = models.DiffType.NO_CHANGE
+        
+        if template_changed:
+            current_diff_type = models.DiffType.TEMPLATE_CHANGED
+            diff_hints.append({
+                "diff_type": models.DiffType.TEMPLATE_CHANGED.value,
+                "detail": "模板内容已变更",
+                "old_value": {
+                    "start_time": original_template_snapshot["start_time"],
+                    "end_time": original_template_snapshot["end_time"],
+                },
+                "new_value": {
+                    "start_time": current_template_snapshot["start_time"],
+                    "end_time": current_template_snapshot["end_time"],
+                },
+            })
+        
+        if slots_changed:
+            current_diff_type = models.DiffType.SLOT_CHANGED
+            diff_hints.append({
+                "diff_type": models.DiffType.SLOT_CHANGED.value,
+                "detail": "环境维护时段已变更",
+                "old_value": original_slots_snapshot,
+                "new_value": current_slots_snapshot,
+            })
+        
+        item_date = date.fromisoformat(item.date)
+        start_dt = _combine_datetime(item_date, template.start_time)
+        end_dt = _combine_datetime(item_date, template.end_time)
+        
+        current_overlaps = check_time_overlap(db, plan.environment_id, start_dt, end_dt)
+        
+        old_conflict_type = item.conflict_type_snapshot
+        new_conflict_type = models.ConflictType.OK
+        new_conflict_window_id = None
+        new_conflict_window_title = None
+        new_conflict_window_status = None
+        new_message = "可创建"
+        
+        if current_overlaps:
+            w = current_overlaps[0]
+            new_conflict_window_id = w.id
+            new_conflict_window_title = w.title
+            new_conflict_window_status = w.status.value if w.status else None
+            
+            if w.status == models.WindowStatus.SUBMITTED:
+                new_conflict_type = models.ConflictType.PENDING_APPROVAL
+                new_message = f"存在审批中窗口: {w.title}"
+            else:
+                new_conflict_type = models.ConflictType.TIME_OVERLAP
+                new_message = f"时间重叠: {w.title}"
+        
+        conflict_changed = (
+            old_conflict_type != new_conflict_type.value or
+            item.conflict_window_id_snapshot != new_conflict_window_id
+        )
+        
+        if conflict_changed:
+            current_diff_type = models.DiffType.CONFLICT_CHANGED
+            diff_hints.append({
+                "diff_type": models.DiffType.CONFLICT_CHANGED.value,
+                "detail": "冲突检测结果已变更",
+                "old_value": {
+                    "conflict_type": old_conflict_type,
+                    "conflict_window_id": item.conflict_window_id_snapshot,
+                    "message": item.message_snapshot,
+                },
+                "new_value": {
+                    "conflict_type": new_conflict_type.value,
+                    "conflict_window_id": new_conflict_window_id,
+                    "message": new_message,
+                },
+            })
+        
+        old_status = item.conflict_window_status_snapshot
+        if old_status and item.conflict_window_id_snapshot:
+            old_window = get_maintenance_window(db, item.conflict_window_id_snapshot)
+            if old_window:
+                new_status = old_window.status.value if old_window.status else None
+                if old_status != new_status:
+                    current_diff_type = models.DiffType.WINDOW_STATUS_CHANGED
+                    diff_hints.append({
+                        "diff_type": models.DiffType.WINDOW_STATUS_CHANGED.value,
+                        "detail": "冲突窗口状态已变更",
+                        "old_value": old_status,
+                        "new_value": new_status,
+                    })
+        
+        latest_precheck = schemas.PlanItemSnapshot(
+            conflict_type=new_conflict_type,
+            conflict_window_id=new_conflict_window_id,
+            conflict_window_title=new_conflict_window_title,
+            conflict_window_status=new_conflict_window_status,
+            message=new_message,
+        )
+        
+        item.current_diff_type = current_diff_type
+        item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False) if diff_hints else None
+        item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
+        
+        if current_diff_type != models.DiffType.NO_CHANGE:
+            item.status = models.PlanItemStatus.CHANGED
+            changed_count += 1
+        else:
+            unchanged_count += 1
+        
+        details.append({
+            "item_id": item.id,
+            "date": item.date,
+            "diff_type": current_diff_type.value,
+            "diff_hints": diff_hints,
+        })
+    
+    if changed_count > 0:
+        plan.status = models.PlanStatus.CONFIRMING
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_DETECT_CHANGE, operator_id,
+        detail=f"检测变更: 共 {plan.total_count} 条，变更 {changed_count} 条，无变化 {unchanged_count} 条，已剔除 {excluded_count} 条",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    
+    return schemas.SchedulePlanDetectChangeResult(
+        plan_id=plan.id,
+        total_items=plan.total_count,
+        changed_items=changed_count,
+        unchanged_items=unchanged_count,
+        excluded_items=excluded_count,
+        details=details,
+    )
+
+
+def recheck_plan_item(
+    db: Session, plan_id: int, req: schemas.SchedulePlanRecheckItem
+) -> models.SchedulePlanItem:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "recheck")
+    
+    if plan.status not in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMING]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能重新预检")
+    
+    item = db.query(models.SchedulePlanItem).filter(
+        models.SchedulePlanItem.id == req.item_id,
+        models.SchedulePlanItem.plan_id == plan_id,
+    ).first()
+    
+    if not item:
+        raise BusinessError(f"方案条目 ID={req.item_id} 不存在", 404)
+    
+    if item.status == models.PlanItemStatus.EXCLUDED:
+        raise BusinessError("该条目已被剔除，不能重新预检")
+    
+    template = plan.template
+    if not template:
+        raise BusinessError("关联模板不存在", 404)
+    
+    item_date = date.fromisoformat(item.date)
+    start_dt = _combine_datetime(item_date, template.start_time)
+    end_dt = _combine_datetime(item_date, template.end_time)
+    
+    overlaps = check_time_overlap(db, plan.environment_id, start_dt, end_dt)
+    
+    new_conflict_type = models.ConflictType.OK
+    new_conflict_window_id = None
+    new_conflict_window_title = None
+    new_conflict_window_status = None
+    new_message = "可创建"
+    
+    if overlaps:
+        w = overlaps[0]
+        new_conflict_window_id = w.id
+        new_conflict_window_title = w.title
+        new_conflict_window_status = w.status.value if w.status else None
+        
+        if w.status == models.WindowStatus.SUBMITTED:
+            new_conflict_type = models.ConflictType.PENDING_APPROVAL
+            new_message = f"存在审批中窗口: {w.title}"
+        else:
+            new_conflict_type = models.ConflictType.TIME_OVERLAP
+            new_message = f"时间重叠: {w.title}"
+    
+    latest_precheck = schemas.PlanItemSnapshot(
+        conflict_type=new_conflict_type,
+        conflict_window_id=new_conflict_window_id,
+        conflict_window_title=new_conflict_window_title,
+        conflict_window_status=new_conflict_window_status,
+        message=new_message,
+    )
+    
+    item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
+    item.current_diff_type = models.DiffType.NO_CHANGE
+    item.current_diff_detail = None
+    item.status = models.PlanItemStatus.APPROVED
+    item.updated_at = datetime.utcnow()
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_RECHECK, req.operator_id,
+        item_id=item.id,
+        detail=f"重新预检条目 {item.date}: 结果={new_conflict_type.value}",
+    )
+    
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def exclude_plan_item(
+    db: Session, plan_id: int, req: schemas.SchedulePlanExcludeItem
+) -> models.SchedulePlanItem:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "exclude")
+    
+    if plan.status not in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMING]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能剔除条目")
+    
+    item = db.query(models.SchedulePlanItem).filter(
+        models.SchedulePlanItem.id == req.item_id,
+        models.SchedulePlanItem.plan_id == plan_id,
+    ).first()
+    
+    if not item:
+        raise BusinessError(f"方案条目 ID={req.item_id} 不存在", 404)
+    
+    if item.status == models.PlanItemStatus.EXCLUDED:
+        raise BusinessError("该条目已被剔除")
+    
+    old_status = item.status
+    item.status = models.PlanItemStatus.EXCLUDED
+    item.excluded_at = datetime.utcnow()
+    item.excluded_by = req.operator_id
+    item.updated_at = datetime.utcnow()
+    
+    plan.approved_count -= 1
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_EXCLUDE, req.operator_id,
+        item_id=item.id,
+        detail=f"剔除条目 {item.date}: {req.reason or '无备注'}",
+    )
+    
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def confirm_schedule_plan(
+    db: Session, plan_id: int, req: schemas.SchedulePlanConfirm
+) -> models.SchedulePlan:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "confirm")
+    
+    if plan.status not in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMING]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能确认")
+    
+    items_to_confirm = []
+    if req.item_ids:
+        for item in plan.items:
+            if item.id in req.item_ids and item.status not in [
+                models.PlanItemStatus.EXCLUDED,
+                models.PlanItemStatus.CONFIRMED,
+                models.PlanItemStatus.CREATED,
+            ]:
+                if item.status == models.PlanItemStatus.CHANGED:
+                    raise BusinessError(
+                        f"条目 {item.date} 存在变更未处理，请先重新预检或剔除后再确认"
+                    )
+                items_to_confirm.append(item)
+    else:
+        for item in plan.items:
+            if item.status not in [
+                models.PlanItemStatus.EXCLUDED,
+                models.PlanItemStatus.CONFIRMED,
+                models.PlanItemStatus.CREATED,
+            ]:
+                if item.status == models.PlanItemStatus.CHANGED:
+                    raise BusinessError(
+                        f"条目 {item.date} 存在变更未处理，请先重新预检或剔除后再确认"
+                    )
+                items_to_confirm.append(item)
+    
+    if not items_to_confirm:
+        raise BusinessError("没有可确认的条目")
+    
+    for item in items_to_confirm:
+        item.status = models.PlanItemStatus.CONFIRMED
+        item.confirmed_at = datetime.utcnow()
+        item.confirmed_by = req.operator_id
+        item.updated_at = datetime.utcnow()
+    
+    plan.confirmed_count += len(items_to_confirm)
+    
+    all_confirmed = True
+    for item in plan.items:
+        if item.status not in [
+            models.PlanItemStatus.CONFIRMED,
+            models.PlanItemStatus.CREATED,
+            models.PlanItemStatus.EXCLUDED,
+        ]:
+            all_confirmed = False
+            break
+    
+    if all_confirmed:
+        plan.status = models.PlanStatus.CONFIRMED
+    
+    plan.updated_at = datetime.utcnow()
+    
+    changed_items = [i for i in plan.items if i.status == models.PlanItemStatus.CHANGED]
+    excluded_items = [i for i in plan.items if i.status == models.PlanItemStatus.EXCLUDED]
+    
+    diff_summary = {
+        "confirmed_count": len(items_to_confirm),
+        "changed_count": len(changed_items),
+        "excluded_count": len(excluded_items),
+        "changed_items": [{"id": i.id, "date": i.date} for i in changed_items],
+        "excluded_items": [{"id": i.id, "date": i.date} for i in excluded_items],
+    }
+    
+    confirmation = models.PlanConfirmation(
+        plan_id=plan.id,
+        operator_id=req.operator_id,
+        confirmation_type="BATCH_CONFIRM",
+        item_ids=json.dumps([i.id for i in items_to_confirm], ensure_ascii=False),
+        excluded_item_ids=json.dumps([i.id for i in excluded_items], ensure_ascii=False),
+        diff_summary=json.dumps(diff_summary, ensure_ascii=False),
+        remark=req.remark,
+    )
+    db.add(confirmation)
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_CONFIRM, req.operator_id,
+        detail=f"确认执行 {len(items_to_confirm)} 条: {req.remark or '无备注'}",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def execute_schedule_plan(
+    db: Session, plan_id: int, req: schemas.SchedulePlanExecute
+) -> schemas.BatchGenerateResult:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, req.operator_id, "execute")
+    
+    if plan.status != models.PlanStatus.CONFIRMED:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能执行创建")
+    
+    template = plan.template
+    if not template:
+        raise BusinessError("关联模板不存在", 404)
+    
+    items_to_create = [
+        item for item in plan.items
+        if item.status == models.PlanItemStatus.CONFIRMED
+    ]
+    
+    if not items_to_create:
+        raise BusinessError("没有可创建的条目")
+    
+    created_windows = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    for item in items_to_create:
+        try:
+            d = date.fromisoformat(item.date)
+            start_dt = _combine_datetime(d, template.start_time)
+            end_dt = _combine_datetime(d, template.end_time)
+            
+            win = create_maintenance_window(db, schemas.MaintenanceWindowCreate(
+                title=f"{template.name} - {d.isoformat()}",
+                description=template.description or "",
+                environment_id=template.environment_id,
+                start_time=start_dt,
+                end_time=end_dt,
+                creator_id=req.operator_id,
+                change_reason=template.change_reason or f"方案执行: {plan.name}",
+            ))
+            
+            item.window_id = win.id
+            item.status = models.PlanItemStatus.CREATED
+            item.updated_at = datetime.utcnow()
+            created_windows.append(win)
+            success_count += 1
+        except Exception as e:
+            fail_count += 1
+    
+    plan.created_count += success_count
+    plan.status = models.PlanStatus.EXECUTED
+    plan.updated_at = datetime.utcnow()
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_EXECUTE, req.operator_id,
+        detail=f"执行创建 {len(items_to_create)} 条，成功 {success_count}，失败 {fail_count}",
+    )
+    
+    precheck_items = []
+    for item in plan.items:
+        precheck_data = json.loads(item.precheck_snapshot)
+        precheck_items.append(schemas.PreCheckItem(**precheck_data))
+    
+    db.commit()
+    db.refresh(plan)
+    
+    return schemas.BatchGenerateResult(
+        batch_id=plan.id,
+        total_count=len(items_to_create),
+        success_count=success_count,
+        skip_count=skip_count,
+        fail_count=fail_count,
+        status="EXECUTED",
+        precheck_items=precheck_items,
+        created_windows=created_windows,
+    )
+
+
+def cancel_schedule_plan(
+    db: Session, plan_id: int, operator_id: int
+) -> models.SchedulePlan:
+    plan = get_schedule_plan(db, plan_id)
+    if not plan:
+        raise BusinessError(f"方案 ID={plan_id} 不存在", 404)
+    
+    _check_plan_permission(db, plan, operator_id, "cancel")
+    
+    if plan.status in [models.PlanStatus.EXECUTED, models.PlanStatus.CANCELLED]:
+        raise BusinessError(f"当前状态 {plan.status.value} 不能取消")
+    
+    old_status = plan.status
+    plan.status = models.PlanStatus.CANCELLED
+    plan.updated_at = datetime.utcnow()
+    
+    _add_plan_audit_log(
+        db, plan, models.PlanAction.PLAN_CANCEL, operator_id,
+        detail=f"取消方案: 原状态={old_status.value}",
+    )
+    
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def get_plan_confirmations(
+    db: Session, plan_id: int
+) -> List[models.PlanConfirmation]:
+    return db.query(models.PlanConfirmation).filter(
+        models.PlanConfirmation.plan_id == plan_id
+    ).order_by(models.PlanConfirmation.created_at.desc()).all()
+
+
+def get_plan_audit_logs(
+    db: Session, plan_id: int
+) -> List[models.PlanAuditLog]:
+    return db.query(models.PlanAuditLog).filter(
+        models.PlanAuditLog.plan_id == plan_id
+    ).order_by(models.PlanAuditLog.created_at.desc()).all()
+
+
+# ============== Plan Import/Export ==============
+
+def export_schedule_plans(
+    db: Session,
+    plan_ids: Optional[List[int]] = None,
+    user_id: Optional[int] = None,
+) -> List[dict]:
+    q = db.query(models.SchedulePlan)
+    if plan_ids:
+        q = q.filter(models.SchedulePlan.id.in_(plan_ids))
+    if user_id:
+        q = q.filter(models.SchedulePlan.creator_id == user_id)
+    
+    plans = q.all()
+    result = []
+    
+    for plan in plans:
+        env = plan.environment
+        template = plan.template
+        creator = plan.creator
+        approver = plan.approver
+        
+        items_data = []
+        for item in plan.items:
+            items_data.append({
+                "date": item.date,
+                "start_time": item.start_time,
+                "end_time": item.end_time,
+                "precheck_snapshot": json.loads(item.precheck_snapshot) if item.precheck_snapshot else {},
+                "conflict_type_snapshot": item.conflict_type_snapshot,
+                "conflict_window_id_snapshot": item.conflict_window_id_snapshot,
+                "conflict_window_title_snapshot": item.conflict_window_title_snapshot,
+                "conflict_window_status_snapshot": item.conflict_window_status_snapshot,
+                "message_snapshot": item.message_snapshot,
+                "status": item.status.value if item.status else None,
+            })
+        
+        confirmations_data = []
+        for conf in plan.confirmations:
+            operator = conf.operator
+            confirmations_data.append({
+                "confirmation_type": conf.confirmation_type,
+                "operator_username": operator.username if operator else None,
+                "operator_name": operator.display_name if operator else None,
+                "item_ids": json.loads(conf.item_ids) if conf.item_ids else [],
+                "excluded_item_ids": json.loads(conf.excluded_item_ids) if conf.excluded_item_ids else [],
+                "diff_summary": json.loads(conf.diff_summary) if conf.diff_summary else {},
+                "remark": conf.remark,
+                "created_at": conf.created_at.isoformat() if conf.created_at else None,
+            })
+        
+        audit_data = []
+        for log in plan.audit_logs:
+            operator = log.operator
+            audit_data.append({
+                "action": log.action.value if log.action else None,
+                "operator_username": operator.username if operator else None,
+                "operator_name": operator.display_name if operator else None,
+                "item_id": log.item_id,
+                "detail": log.detail,
+                "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            })
+        
+        specific_dates = None
+        if plan.specific_dates:
+            specific_dates = json.loads(plan.specific_dates)
+        
+        result.append({
+            "name": plan.name,
+            "description": plan.description,
+            "template_name": template.name if template else None,
+            "template_version_snapshot": json.loads(plan.template_version_snapshot),
+            "environment_name": env.name if env else None,
+            "environment_slots_snapshot": json.loads(plan.environment_slots_snapshot),
+            "generate_mode": plan.generate_mode,
+            "date_from": plan.date_from.isoformat() if plan.date_from else None,
+            "date_to": plan.date_to.isoformat() if plan.date_to else None,
+            "specific_dates": specific_dates,
+            "operator_remark": plan.operator_remark,
+            "status": plan.status.value if plan.status else None,
+            "approval_reason": plan.approval_reason,
+            "items": items_data,
+            "confirmations": confirmations_data,
+            "audit_logs": audit_data,
+            "creator_username": creator.username if creator else None,
+            "approver_username": approver.username if approver else None,
+            "created_at": plan.created_at.isoformat() if plan.created_at else None,
+        })
+    
+    return result
+
+
+def import_schedule_plans(
+    db: Session, req: schemas.PlanImportRequest
+) -> schemas.PlanImportResult:
+    operator = get_user(db, req.operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
+    
+    total = len(req.plans)
+    success = 0
+    skipped = 0
+    failed = 0
+    details = []
+    
+    for idx, item in enumerate(req.plans):
+        try:
+            env = get_environment_by_name(db, item.environment_name)
+            if not env:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "name": item.name,
+                    "status": "failed",
+                    "reason": f"环境 '{item.environment_name}' 不存在",
+                })
+                continue
+            
+            template = db.query(models.WindowTemplate).filter(
+                models.WindowTemplate.name == item.template_name,
+                models.WindowTemplate.creator_id == req.operator_id,
+            ).first()
+            
+            if not template:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "name": item.name,
+                    "status": "failed",
+                    "reason": f"模板 '{item.template_name}' 不存在",
+                })
+                continue
+            
+            existing = db.query(models.SchedulePlan).filter(
+                models.SchedulePlan.name == item.name,
+                models.SchedulePlan.creator_id == req.operator_id,
+            ).first()
+            
+            if existing:
+                if req.on_conflict == "skip":
+                    skipped += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "skipped",
+                        "reason": "同名方案已存在，跳过",
+                    })
+                    continue
+                elif req.on_conflict == "overwrite":
+                    db.delete(existing)
+                    db.flush()
+                else:
+                    failed += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "failed",
+                        "reason": "同名方案已存在",
+                    })
+                    continue
+            
+            dates = []
+            if item.generate_mode == "date_range":
+                if item.date_from and item.date_to:
+                    d_from = date.fromisoformat(item.date_from[:10])
+                    d_to = date.fromisoformat(item.date_to[:10])
+                    current = d_from
+                    while current <= d_to:
+                        dates.append(current)
+                        current += timedelta(days=1)
+            elif item.generate_mode == "specific_dates":
+                if item.specific_dates:
+                    dates = [date.fromisoformat(d[:10]) for d in item.specific_dates]
+            
+            date_from = _combine_datetime(min(dates), template.start_time) if dates else None
+            date_to = _combine_datetime(max(dates), template.end_time) if dates else None
+            
+            status_map = {s.value: s for s in models.PlanStatus}
+            plan_status = status_map.get(item.status, models.PlanStatus.DRAFT)
+            
+            plan = models.SchedulePlan(
+                name=item.name,
+                description=item.description,
+                template_id=template.id,
+                template_version_snapshot=json.dumps(item.template_version_snapshot, ensure_ascii=False),
+                environment_id=env.id,
+                environment_slots_snapshot=json.dumps(item.environment_slots_snapshot, ensure_ascii=False),
+                generate_mode=item.generate_mode,
+                date_from=date_from,
+                date_to=date_to,
+                specific_dates=json.dumps(item.specific_dates, ensure_ascii=False) if item.specific_dates else None,
+                operator_remark=item.operator_remark,
+                status=plan_status,
+                creator_id=req.operator_id,
+                approval_reason=item.approval_reason,
+                total_count=len(item.items),
+                approved_count=0,
+                confirmed_count=0,
+                created_count=0,
+            )
+            db.add(plan)
+            db.flush()
+            
+            item_status_map = {s.value: s for s in models.PlanItemStatus}
+            for plan_item_data in item.items:
+                if isinstance(plan_item_data, dict):
+                    item_dict = plan_item_data
+                else:
+                    item_dict = plan_item_data.model_dump()
+                item_status = item_status_map.get(item_dict.get("status"), models.PlanItemStatus.PENDING)
+                plan_item = models.SchedulePlanItem(
+                    plan_id=plan.id,
+                    date=item_dict["date"],
+                    start_time=item_dict["start_time"],
+                    end_time=item_dict["end_time"],
+                    precheck_snapshot=json.dumps(item_dict["precheck_snapshot"], ensure_ascii=False),
+                    conflict_type_snapshot=item_dict.get("conflict_type_snapshot"),
+                    conflict_window_id_snapshot=item_dict.get("conflict_window_id_snapshot"),
+                    conflict_window_title_snapshot=item_dict.get("conflict_window_title_snapshot"),
+                    conflict_window_status_snapshot=item_dict.get("conflict_window_status_snapshot"),
+                    message_snapshot=item_dict.get("message_snapshot"),
+                    status=item_status,
+                )
+                db.add(plan_item)
+                
+                if item_status in [models.PlanItemStatus.APPROVED, models.PlanItemStatus.CONFIRMED, models.PlanItemStatus.CREATED]:
+                    plan.approved_count += 1
+                if item_status in [models.PlanItemStatus.CONFIRMED, models.PlanItemStatus.CREATED]:
+                    plan.confirmed_count += 1
+            
+            # 导入确认记录
+            if hasattr(item, 'confirmations') and item.confirmations:
+                for conf_data in item.confirmations:
+                    if isinstance(conf_data, dict):
+                        conf_dict = conf_data
+                    else:
+                        conf_dict = conf_data.model_dump()
+                    confirmation = models.PlanConfirmation(
+                        plan_id=plan.id,
+                        operator_id=conf_dict["operator_id"],
+                        operator_name=conf_dict.get("operator_name"),
+                        remark=conf_dict.get("remark"),
+                        diff_summary=json.dumps(conf_dict.get("diff_summary", {}), ensure_ascii=False),
+                        confirmed_count=conf_dict.get("confirmed_count", 0),
+                        excluded_count=conf_dict.get("excluded_count", 0),
+                        changed_count=conf_dict.get("changed_count", 0),
+                    )
+                    db.add(confirmation)
+            
+            # 导入审计日志
+            if hasattr(item, 'audit_logs') and item.audit_logs:
+                for log_data in item.audit_logs:
+                    if isinstance(log_data, dict):
+                        log_dict = log_data
+                    else:
+                        log_dict = log_data.model_dump()
+                    action_map = {a.value: a for a in models.PlanAction}
+                    log_action = action_map.get(log_dict["action"], models.PlanAction.PLAN_IMPORT)
+                    audit_log = models.PlanAuditLog(
+                        plan_id=plan.id,
+                        action=log_action,
+                        operator_id=log_dict.get("operator_id", req.operator_id),
+                        operator_name=log_dict.get("operator_name"),
+                        detail=log_dict.get("detail"),
+                        old_value=json.dumps(log_dict.get("old_value", {}), ensure_ascii=False) if log_dict.get("old_value") else None,
+                        new_value=json.dumps(log_dict.get("new_value", {}), ensure_ascii=False) if log_dict.get("new_value") else None,
+                    )
+                    db.add(audit_log)
+            
+            _add_plan_audit_log(
+                db, plan, models.PlanAction.PLAN_IMPORT, req.operator_id,
+                detail=f"导入方案: {item.name}，共 {len(item.items)} 条",
+            )
+            
+            success += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "created",
+                "id": plan.id,
+                "items_count": len(item.items),
+            })
+            
+        except BusinessError as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": e.message,
+            })
+        except Exception as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": str(e),
+            })
+    
+    db.commit()
+    
+    return schemas.PlanImportResult(
+        total=total,
+        success=success,
+        skipped=skipped,
+        failed=failed,
+        details=details,
+    )

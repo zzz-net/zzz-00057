@@ -359,6 +359,252 @@ def regenerate_from_batch_record(
     return services.regenerate_from_batch_record(db, batch_id, operator_id)
 
 
+# ========== Schedule Plan ==========
+
+@app.post("/schedule-plans", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def create_schedule_plan(plan_in: schemas.SchedulePlanCreate, db: Session = Depends(get_db)):
+    return services.create_schedule_plan(db, plan_in)
+
+
+@app.get("/schedule-plans", response_model=List[schemas.SchedulePlanListItem], tags=["排期方案"])
+def list_schedule_plans(
+    template_id: Optional[int] = Query(None),
+    creator_id: Optional[int] = Query(None),
+    status: Optional[models.PlanStatus] = Query(None),
+    db: Session = Depends(get_db),
+):
+    plans = services.list_schedule_plans(db, template_id, creator_id, status)
+    result = []
+    for plan in plans:
+        tpl = plan.template
+        env = plan.environment
+        creator = plan.creator
+        approver = plan.approver
+        result.append({
+            "id": plan.id,
+            "name": plan.name,
+            "description": plan.description,
+            "template_id": plan.template_id,
+            "template_name": tpl.name if tpl else None,
+            "environment_id": plan.environment_id,
+            "environment_name": env.name if env else None,
+            "status": plan.status,
+            "generate_mode": plan.generate_mode,
+            "total_count": plan.total_count,
+            "approved_count": plan.approved_count,
+            "confirmed_count": plan.confirmed_count,
+            "created_count": plan.created_count,
+            "creator_id": plan.creator_id,
+            "creator_name": creator.display_name if creator else None,
+            "approver_id": plan.approver_id,
+            "approver_name": approver.display_name if approver else None,
+            "created_at": plan.created_at,
+            "updated_at": plan.updated_at,
+        })
+    return result
+
+
+@app.get("/schedule-plans/{plan_id}", response_model=schemas.SchedulePlanDetail, tags=["排期方案"])
+def get_schedule_plan(plan_id: int, db: Session = Depends(get_db)):
+    plan = services.get_schedule_plan(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    
+    items_with_hints = []
+    for item in plan.items:
+        diff_hints = []
+        if item.current_diff_detail:
+            try:
+                diff_hints = json.loads(item.current_diff_detail)
+            except (json.JSONDecodeError, TypeError):
+                diff_hints = []
+        
+        items_with_hints.append({
+            "id": item.id,
+            "plan_id": item.plan_id,
+            "date": item.date,
+            "start_time": item.start_time,
+            "end_time": item.end_time,
+            "status": item.status,
+            "conflict_type_snapshot": item.conflict_type_snapshot,
+            "conflict_window_id_snapshot": item.conflict_window_id_snapshot,
+            "conflict_window_title_snapshot": item.conflict_window_title_snapshot,
+            "conflict_window_status_snapshot": item.conflict_window_status_snapshot,
+            "message_snapshot": item.message_snapshot,
+            "current_diff_type": item.current_diff_type,
+            "current_diff_detail": item.current_diff_detail,
+            "latest_precheck": item.latest_precheck,
+            "window_id": item.window_id,
+            "excluded_at": item.excluded_at,
+            "excluded_by": item.excluded_by,
+            "confirmed_at": item.confirmed_at,
+            "confirmed_by": item.confirmed_by,
+            "diff_hints": diff_hints,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+        })
+    
+    return {
+        "id": plan.id,
+        "name": plan.name,
+        "description": plan.description,
+        "template_id": plan.template_id,
+        "generate_mode": plan.generate_mode,
+        "date_from": plan.date_from,
+        "date_to": plan.date_to,
+        "specific_dates": plan.specific_dates,
+        "operator_remark": plan.operator_remark,
+        "status": plan.status,
+        "environment_id": plan.environment_id,
+        "template_version_snapshot": plan.template_version_snapshot,
+        "environment_slots_snapshot": plan.environment_slots_snapshot,
+        "creator_id": plan.creator_id,
+        "approver_id": plan.approver_id,
+        "approval_reason": plan.approval_reason,
+        "approved_at": plan.approved_at,
+        "total_count": plan.total_count,
+        "approved_count": plan.approved_count,
+        "confirmed_count": plan.confirmed_count,
+        "created_count": plan.created_count,
+        "created_at": plan.created_at,
+        "updated_at": plan.updated_at,
+        "creator": plan.creator,
+        "approver": plan.approver,
+        "items": items_with_hints,
+    }
+
+
+@app.post("/schedule-plans/{plan_id}/submit", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def submit_schedule_plan(
+    plan_id: int,
+    req: schemas.SchedulePlanSubmit,
+    db: Session = Depends(get_db),
+):
+    return services.submit_schedule_plan(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/approve", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def approve_schedule_plan(
+    plan_id: int,
+    req: schemas.SchedulePlanApprove,
+    db: Session = Depends(get_db),
+):
+    return services.approve_schedule_plan(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/reject", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def reject_schedule_plan(
+    plan_id: int,
+    req: schemas.SchedulePlanReject,
+    db: Session = Depends(get_db),
+):
+    return services.reject_schedule_plan(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/detect-changes", response_model=schemas.SchedulePlanDetectChangeResult, tags=["排期方案"])
+def detect_plan_changes(
+    plan_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.detect_plan_changes(db, plan_id, operator_id)
+
+
+@app.post("/schedule-plans/{plan_id}/items/{item_id}/recheck", response_model=schemas.SchedulePlanItem, tags=["排期方案"])
+def recheck_plan_item(
+    plan_id: int,
+    item_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    req = schemas.SchedulePlanRecheckItem(item_id=item_id, operator_id=operator_id)
+    return services.recheck_plan_item(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/items/{item_id}/exclude", response_model=schemas.SchedulePlanItem, tags=["排期方案"])
+def exclude_plan_item(
+    plan_id: int,
+    item_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    reason: Optional[str] = Query(None, description="剔除原因"),
+    db: Session = Depends(get_db),
+):
+    req = schemas.SchedulePlanExcludeItem(item_id=item_id, operator_id=operator_id, reason=reason)
+    return services.exclude_plan_item(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/confirm", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def confirm_schedule_plan(
+    plan_id: int,
+    req: schemas.SchedulePlanConfirm,
+    db: Session = Depends(get_db),
+):
+    return services.confirm_schedule_plan(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/execute", response_model=schemas.BatchGenerateResult, tags=["排期方案"])
+def execute_schedule_plan(
+    plan_id: int,
+    req: schemas.SchedulePlanExecute,
+    db: Session = Depends(get_db),
+):
+    return services.execute_schedule_plan(db, plan_id, req)
+
+
+@app.post("/schedule-plans/{plan_id}/cancel", response_model=schemas.SchedulePlan, tags=["排期方案"])
+def cancel_schedule_plan(
+    plan_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.cancel_schedule_plan(db, plan_id, operator_id)
+
+
+@app.get("/schedule-plans/{plan_id}/confirmations", response_model=List[schemas.PlanConfirmation], tags=["排期方案"])
+def get_plan_confirmations(plan_id: int, db: Session = Depends(get_db)):
+    plan = services.get_schedule_plan(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    return services.get_plan_confirmations(db, plan_id)
+
+
+@app.get("/schedule-plans/{plan_id}/audit-logs", response_model=List[schemas.PlanAuditLog], tags=["排期方案"])
+def get_plan_audit_logs(plan_id: int, db: Session = Depends(get_db)):
+    plan = services.get_schedule_plan(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    return services.get_plan_audit_logs(db, plan_id)
+
+
+# ========== Schedule Plan Import/Export ==========
+
+@app.post("/schedule-plans/export", tags=["方案导入导出"])
+def export_schedule_plans(
+    plan_ids: Optional[List[int]] = Query(None),
+    user_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    data = services.export_schedule_plans(db, plan_ids, user_id)
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    file_path = os.path.join(export_dir, f"schedule_plans_{ts}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return {
+        "detail": "导出成功",
+        "file_path": file_path,
+        "storage_location": "system_tempdir_outside_repo",
+        "count": len(data),
+        "data": data,
+    }
+
+
+@app.post("/schedule-plans/import", response_model=schemas.PlanImportResult, tags=["方案导入导出"])
+def import_schedule_plans(req: schemas.PlanImportRequest, db: Session = Depends(get_db)):
+    return services.import_schedule_plans(db, req)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

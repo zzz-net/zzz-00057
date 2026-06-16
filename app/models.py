@@ -194,3 +194,146 @@ class BatchGenerateRecord(Base):
     creator = relationship("User", foreign_keys=[creator_id])
     environment = relationship("Environment")
     template = relationship("WindowTemplate")
+
+
+class PlanStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CONFIRMING = "CONFIRMING"
+    CONFIRMED = "CONFIRMED"
+    EXECUTED = "EXECUTED"
+    CANCELLED = "CANCELLED"
+
+
+class PlanItemStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    CHANGED = "CHANGED"
+    EXCLUDED = "EXCLUDED"
+    CONFIRMED = "CONFIRMED"
+    CREATED = "CREATED"
+
+
+class DiffType(str, enum.Enum):
+    TEMPLATE_CHANGED = "TEMPLATE_CHANGED"
+    SLOT_CHANGED = "SLOT_CHANGED"
+    WINDOW_STATUS_CHANGED = "WINDOW_STATUS_CHANGED"
+    CONFLICT_CHANGED = "CONFLICT_CHANGED"
+    NO_CHANGE = "NO_CHANGE"
+
+
+class SchedulePlan(Base):
+    __tablename__ = "schedule_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    template_id = Column(Integer, ForeignKey("window_templates.id"), nullable=False)
+    template_version_snapshot = Column(Text, nullable=False)
+    environment_id = Column(Integer, ForeignKey("environments.id"), nullable=False)
+    environment_slots_snapshot = Column(Text, nullable=False)
+    generate_mode = Column(String(20), nullable=False)
+    date_from = Column(DateTime, nullable=True)
+    date_to = Column(DateTime, nullable=True)
+    specific_dates = Column(Text, nullable=True)
+    operator_remark = Column(Text, nullable=True)
+    status = Column(Enum(PlanStatus), default=PlanStatus.DRAFT, nullable=False)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    approver_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approval_reason = Column(Text, nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    total_count = Column(Integer, default=0)
+    approved_count = Column(Integer, default=0)
+    confirmed_count = Column(Integer, default=0)
+    created_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[creator_id])
+    approver = relationship("User", foreign_keys=[approver_id])
+    template = relationship("WindowTemplate")
+    environment = relationship("Environment")
+    items = relationship("SchedulePlanItem", back_populates="plan", cascade="all, delete-orphan")
+    audit_logs = relationship("PlanAuditLog", back_populates="plan", cascade="all, delete-orphan")
+    confirmations = relationship("PlanConfirmation", back_populates="plan", cascade="all, delete-orphan")
+
+
+class SchedulePlanItem(Base):
+    __tablename__ = "schedule_plan_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("schedule_plans.id"), nullable=False)
+    date = Column(String(10), nullable=False)
+    start_time = Column(String(5), nullable=False)
+    end_time = Column(String(5), nullable=False)
+    precheck_snapshot = Column(Text, nullable=False)
+    conflict_type_snapshot = Column(String(30), nullable=True)
+    conflict_window_id_snapshot = Column(Integer, nullable=True)
+    conflict_window_title_snapshot = Column(String(200), nullable=True)
+    conflict_window_status_snapshot = Column(String(30), nullable=True)
+    message_snapshot = Column(Text, nullable=True)
+    status = Column(Enum(PlanItemStatus), default=PlanItemStatus.PENDING, nullable=False)
+    current_diff_type = Column(Enum(DiffType), nullable=True)
+    current_diff_detail = Column(Text, nullable=True)
+    latest_precheck = Column(Text, nullable=True)
+    window_id = Column(Integer, ForeignKey("maintenance_windows.id"), nullable=True)
+    excluded_at = Column(DateTime, nullable=True)
+    excluded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    confirmed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    plan = relationship("SchedulePlan", back_populates="items")
+    window = relationship("MaintenanceWindow")
+
+
+class PlanConfirmation(Base):
+    __tablename__ = "plan_confirmations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("schedule_plans.id"), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    confirmation_type = Column(String(30), nullable=False)
+    item_ids = Column(Text, nullable=True)
+    excluded_item_ids = Column(Text, nullable=True)
+    rechecked_item_ids = Column(Text, nullable=True)
+    diff_summary = Column(Text, nullable=True)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    plan = relationship("SchedulePlan", back_populates="confirmations")
+    operator = relationship("User", foreign_keys=[operator_id])
+
+
+class PlanAction(str, enum.Enum):
+    PLAN_CREATE = "PLAN_CREATE"
+    PLAN_SUBMIT = "PLAN_SUBMIT"
+    PLAN_APPROVE = "PLAN_APPROVE"
+    PLAN_REJECT = "PLAN_REJECT"
+    PLAN_DETECT_CHANGE = "PLAN_DETECT_CHANGE"
+    PLAN_RECHECK = "PLAN_RECHECK"
+    PLAN_EXCLUDE = "PLAN_EXCLUDE"
+    PLAN_CONFIRM = "PLAN_CONFIRM"
+    PLAN_EXECUTE = "PLAN_EXECUTE"
+    PLAN_CANCEL = "PLAN_CANCEL"
+    PLAN_IMPORT = "PLAN_IMPORT"
+    PLAN_EXPORT = "PLAN_EXPORT"
+
+
+class PlanAuditLog(Base):
+    __tablename__ = "plan_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("schedule_plans.id"), nullable=False)
+    action = Column(Enum(PlanAction), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    item_id = Column(Integer, nullable=True)
+    detail = Column(Text, nullable=True)
+    snapshot = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    plan = relationship("SchedulePlan", back_populates="audit_logs")
+    operator = relationship("User", foreign_keys=[operator_id])
