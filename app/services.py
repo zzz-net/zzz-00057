@@ -4314,24 +4314,52 @@ def _add_proxy_audit_log(
     db.add(log)
 
 
-def expire_stale_proxies(db: Session) -> int:
-    now = datetime.utcnow()
+def _compute_effective_status(
+    proxy: models.ApprovalProxy,
+    now: Optional[datetime] = None,
+) -> models.ProxyStatus:
+    if now is None:
+        now = datetime.utcnow()
+    if proxy.status in [models.ProxyStatus.REVOKED, models.ProxyStatus.EXPIRED, models.ProxyStatus.INACTIVE]:
+        return proxy.status
+    if proxy.valid_to <= now:
+        return models.ProxyStatus.EXPIRED
+    return models.ProxyStatus.ACTIVE
+
+
+def normalize_proxy_lifecycle(db: Session, now: Optional[datetime] = None) -> dict:
+    if now is None:
+        now = datetime.utcnow()
     expired_count = 0
-    active_proxies = db.query(models.ApprovalProxy).filter(
+
+    candidates = db.query(models.ApprovalProxy).filter(
         models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
-        models.ApprovalProxy.valid_to < now,
     ).all()
-    for proxy in active_proxies:
-        proxy.status = models.ProxyStatus.EXPIRED
+
+    for proxy in candidates:
+        expected = _compute_effective_status(proxy, now)
+        if expected == proxy.status:
+            continue
+
+        proxy.status = expected
         proxy.updated_at = now
-        _add_proxy_audit_log(
-            db, proxy, models.ProxyAction.PROXY_EXPIRE, proxy.creator_id,
-            detail=f"代理授权过期: {proxy.valid_to.isoformat()}",
-        )
-        expired_count += 1
+
+        if expected == models.ProxyStatus.EXPIRED:
+            _add_proxy_audit_log(
+                db, proxy, models.ProxyAction.PROXY_EXPIRE, proxy.creator_id,
+                detail=f"代理授权过期: {proxy.valid_to.isoformat()}",
+            )
+            expired_count += 1
+
     if expired_count:
         db.commit()
-    return expired_count
+
+    return {"activated": 0, "expired": expired_count}
+
+
+def expire_stale_proxies(db: Session) -> int:
+    result = normalize_proxy_lifecycle(db)
+    return result["expired"]
 
 
 def create_approval_proxy(
@@ -4412,7 +4440,6 @@ def create_approval_proxy(
         )
 
     now = datetime.utcnow()
-    initial_status = models.ProxyStatus.ACTIVE if proxy_in.valid_from <= now else models.ProxyStatus.INACTIVE
 
     proxy = models.ApprovalProxy(
         approver_id=proxy_in.approver_id,
@@ -4421,7 +4448,7 @@ def create_approval_proxy(
         delegate_scope=delegate_scope_str,
         valid_from=proxy_in.valid_from,
         valid_to=proxy_in.valid_to,
-        status=initial_status,
+        status=models.ProxyStatus.ACTIVE,
         reason=proxy_in.reason,
         remark=proxy_in.remark,
         creator_id=proxy_in.creator_id,
@@ -4441,8 +4468,22 @@ def create_approval_proxy(
     return proxy
 
 
-def get_approval_proxy(db: Session, proxy_id: int) -> Optional[models.ApprovalProxy]:
-    return db.query(models.ApprovalProxy).filter(models.ApprovalProxy.id == proxy_id).first()
+def get_approval_proxy(db: Session, proxy_id: int, normalize: bool = True) -> Optional[models.ApprovalProxy]:
+    proxy = db.query(models.ApprovalProxy).filter(models.ApprovalProxy.id == proxy_id).first()
+    if proxy and normalize:
+        now = datetime.utcnow()
+        expected = _compute_effective_status(proxy, now)
+        if expected != proxy.status:
+            proxy.status = expected
+            proxy.updated_at = now
+            if expected == models.ProxyStatus.EXPIRED:
+                _add_proxy_audit_log(
+                    db, proxy, models.ProxyAction.PROXY_EXPIRE, proxy.creator_id,
+                    detail=f"代理授权过期: {proxy.valid_to.isoformat()}",
+                )
+            db.commit()
+            db.refresh(proxy)
+    return proxy
 
 
 def list_approval_proxies(
@@ -4452,7 +4493,7 @@ def list_approval_proxies(
     environment_id: Optional[int] = None,
     status: Optional[models.ProxyStatus] = None,
 ) -> List[models.ApprovalProxy]:
-    expire_stale_proxies(db)
+    normalize_proxy_lifecycle(db)
     q = db.query(models.ApprovalProxy)
     if approver_id is not None:
         q = q.filter(models.ApprovalProxy.approver_id == approver_id)
@@ -4498,13 +4539,15 @@ def reactivate_approval_proxy(
     if not proxy:
         raise BusinessError(f"代理授权 ID={proxy_id} 不存在", 404)
 
+    now = datetime.utcnow()
+
     if proxy.status not in [models.ProxyStatus.INACTIVE]:
         raise BusinessError(f"只有 INACTIVE 状态可以重新启用，当前状态={proxy.status.value}", 400)
 
     if operator_id != proxy.approver_id and not user_can_approve(db, operator_id):
         raise BusinessError("只有原审批人或审批角色可以重新启用代理授权", 403)
 
-    if proxy.valid_to <= datetime.utcnow():
+    if proxy.valid_to <= now:
         raise BusinessError("代理授权已过期，不能重新启用", 400)
 
     if not user_can_approve(db, proxy.approver_id):
@@ -4576,7 +4619,7 @@ def check_proxy_delegation(
     required_scope: str,
     now: Optional[datetime] = None,
 ) -> schemas.ProxyDelegationCheckResult:
-    expire_stale_proxies(db)
+    normalize_proxy_lifecycle(db, now)
     if now is None:
         now = datetime.utcnow()
 
@@ -4617,19 +4660,15 @@ def can_user_act_as_approver(
 
 def record_proxy_delegate_action(
     db: Session,
+    proxy_id: int,
     proxy_user_id: int,
-    environment_id: int,
     action_scope: str,
     action_description: str,
     target_window_id: Optional[int] = None,
     target_plan_id: Optional[int] = None,
     target_item_id: Optional[int] = None,
 ) -> Optional[models.ProxyAuditLog]:
-    delegation = check_proxy_delegation(db, proxy_user_id, environment_id, action_scope)
-    if not delegation.is_delegated:
-        return None
-
-    proxy = get_approval_proxy(db, delegation.proxy_id)
+    proxy = get_approval_proxy(db, proxy_id, normalize=False)
     if not proxy:
         return None
 
@@ -4637,7 +4676,7 @@ def record_proxy_delegate_action(
         proxy_id=proxy.id,
         action=models.ProxyAction.PROXY_DELEGATE_ACTION,
         operator_id=proxy_user_id,
-        detail=f"代理人代办操作[{action_scope}]: {action_description}",
+        detail=f"代理人代办操作成功[{action_scope}]: {action_description}",
         snapshot=_proxy_snapshot(proxy),
         target_window_id=target_window_id,
         target_plan_id=target_plan_id,
@@ -4650,19 +4689,15 @@ def record_proxy_delegate_action(
 
 def record_proxy_delegate_reject(
     db: Session,
+    proxy_id: int,
     proxy_user_id: int,
-    environment_id: int,
     action_scope: str,
     reject_reason: str,
     target_window_id: Optional[int] = None,
     target_plan_id: Optional[int] = None,
     target_item_id: Optional[int] = None,
 ) -> Optional[models.ProxyAuditLog]:
-    delegation = check_proxy_delegation(db, proxy_user_id, environment_id, action_scope)
-    if not delegation.is_delegated:
-        return None
-
-    proxy = get_approval_proxy(db, delegation.proxy_id)
+    proxy = get_approval_proxy(db, proxy_id, normalize=False)
     if not proxy:
         return None
 
@@ -4695,7 +4730,7 @@ def export_approval_proxies(
     approver_id: Optional[int] = None,
     environment_id: Optional[int] = None,
 ) -> List[dict]:
-    expire_stale_proxies(db)
+    normalize_proxy_lifecycle(db)
     q = db.query(models.ApprovalProxy)
     if proxy_ids:
         q = q.filter(models.ApprovalProxy.id.in_(proxy_ids))
@@ -4877,10 +4912,11 @@ def import_approval_proxies(
                     resolved_creator_id = creator_user.id
 
             now = datetime.utcnow()
-            if proxy_status == models.ProxyStatus.ACTIVE and valid_from > now:
-                proxy_status = models.ProxyStatus.INACTIVE
-            if proxy_status == models.ProxyStatus.ACTIVE and valid_to <= now:
-                proxy_status = models.ProxyStatus.EXPIRED
+            if proxy_status not in [models.ProxyStatus.REVOKED, models.ProxyStatus.EXPIRED, models.ProxyStatus.INACTIVE]:
+                if proxy_status == models.ProxyStatus.ACTIVE and valid_to <= now:
+                    proxy_status = models.ProxyStatus.EXPIRED
+                else:
+                    proxy_status = models.ProxyStatus.ACTIVE
 
             new_proxy = models.ApprovalProxy(
                 approver_id=approver_user.id,

@@ -185,15 +185,27 @@ def approve_window(win_id: int, req: schemas.ApproveRequest, db: Session = Depen
     if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
         raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
 
-    if delegation.is_delegated:
+    try:
+        result = services.approve_window(db, win_id, req)
+    except services.BusinessError as e:
+        if delegation.is_delegated and delegation.proxy_id:
+            services.record_proxy_delegate_reject(
+                db, delegation.proxy_id, req.operator_id, "WINDOW_APPROVE",
+                e.message,
+                target_window_id=win_id,
+            )
+            db.commit()
+        raise HTTPException(status_code=e.code, detail=e.message)
+
+    if delegation.is_delegated and delegation.proxy_id:
         services.record_proxy_delegate_action(
-            db, req.operator_id, env_id, "WINDOW_APPROVE",
+            db, delegation.proxy_id, req.operator_id, "WINDOW_APPROVE",
             f"代理人代办窗口审批：窗口ID={win_id}, 审批人={req.operator_id}",
             target_window_id=win_id,
         )
         db.commit()
 
-    return services.approve_window(db, win_id, req)
+    return result
 
 
 @app.post("/maintenance-windows/{win_id}/start", response_model=schemas.MaintenanceWindow, tags=["维护窗口"])
@@ -565,15 +577,27 @@ def confirm_schedule_plan(
     if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
         raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
 
-    if delegation.is_delegated:
+    try:
+        result = services.confirm_schedule_plan(db, plan_id, req)
+    except services.BusinessError as e:
+        if delegation.is_delegated and delegation.proxy_id:
+            services.record_proxy_delegate_reject(
+                db, delegation.proxy_id, req.operator_id, "PLAN_CONFIRM",
+                e.message,
+                target_plan_id=plan_id,
+            )
+            db.commit()
+        raise HTTPException(status_code=e.code, detail=e.message)
+
+    if delegation.is_delegated and delegation.proxy_id:
         services.record_proxy_delegate_action(
-            db, req.operator_id, env_id, "PLAN_CONFIRM",
+            db, delegation.proxy_id, req.operator_id, "PLAN_CONFIRM",
             f"代理人代办计划确认：方案ID={plan_id}",
             target_plan_id=plan_id,
         )
         db.commit()
 
-    return services.confirm_schedule_plan(db, plan_id, req)
+    return result
 
 
 @app.post("/schedule-plans/{plan_id}/execute", response_model=schemas.BatchGenerateResult, tags=["排期方案"])
@@ -742,15 +766,25 @@ def activate_freeze_rule(
     if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
         raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
 
-    if delegation.is_delegated:
+    try:
+        result = services.activate_freeze_rule(db, rule_id, req.operator_id)
+    except services.BusinessError as e:
+        if delegation.is_delegated and delegation.proxy_id:
+            services.record_proxy_delegate_reject(
+                db, delegation.proxy_id, req.operator_id, "FREEZE_TOGGLE",
+                e.message,
+            )
+            db.commit()
+        raise HTTPException(status_code=e.code, detail=e.message)
+
+    if delegation.is_delegated and delegation.proxy_id:
         services.record_proxy_delegate_action(
-            db, req.operator_id, env_id, "FREEZE_TOGGLE",
+            db, delegation.proxy_id, req.operator_id, "FREEZE_TOGGLE",
             f"代理人代办冻结规则激活：规则ID={rule_id}",
-            target_window_id=rule_id,
         )
         db.commit()
 
-    return services.activate_freeze_rule(db, rule_id, req.operator_id)
+    return result
 
 
 @app.post("/freeze-rules/{rule_id}/deactivate", response_model=schemas.FreezeRule, tags=["冻结日历"])
@@ -768,15 +802,25 @@ def deactivate_freeze_rule(
     if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
         raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
 
-    if delegation.is_delegated:
+    try:
+        result = services.deactivate_freeze_rule(db, rule_id, req.operator_id)
+    except services.BusinessError as e:
+        if delegation.is_delegated and delegation.proxy_id:
+            services.record_proxy_delegate_reject(
+                db, delegation.proxy_id, req.operator_id, "FREEZE_TOGGLE",
+                e.message,
+            )
+            db.commit()
+        raise HTTPException(status_code=e.code, detail=e.message)
+
+    if delegation.is_delegated and delegation.proxy_id:
         services.record_proxy_delegate_action(
-            db, req.operator_id, env_id, "FREEZE_TOGGLE",
+            db, delegation.proxy_id, req.operator_id, "FREEZE_TOGGLE",
             f"代理人代办冻结规则停用：规则ID={rule_id}",
-            target_window_id=rule_id,
         )
         db.commit()
 
-    return services.deactivate_freeze_rule(db, rule_id, req.operator_id)
+    return result
 
 
 @app.get("/freeze-rules/{rule_id}/audit-logs", tags=["冻结日历"])
