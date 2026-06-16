@@ -830,6 +830,7 @@ class FreezeConflictItem(BaseModel):
     date_from: datetime
     date_to: datetime
     conflict_reason: str
+    overlap_type: Optional[str] = None
 
 
 class FreezeCheckResult(BaseModel):

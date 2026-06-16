@@ -750,13 +750,14 @@ def check_freeze(
         scope_enum = models.FreezeRuleScope(scope)
     except ValueError:
         pass
-    
+
     conflicts = services.check_freeze_conflicts(
         db, environment_id, start_time, end_time, scope_enum
     )
-    
+
     conflict_items = []
     for rule in conflicts:
+        overlap_type = services._classify_overlap_type(start_time, end_time, rule)
         conflict_items.append(schemas.FreezeConflictItem(
             rule_id=rule.id,
             rule_name=rule.name,
@@ -764,9 +765,10 @@ def check_freeze(
             reason=rule.reason,
             date_from=rule.date_from,
             date_to=rule.date_to,
-            conflict_reason=services._build_freeze_conflict_reason(rule, scope),
+            conflict_reason=services._build_freeze_conflict_reason(rule, scope, start_time, end_time),
+            overlap_type=overlap_type,
         ))
-    
+
     return schemas.FreezeCheckResult(
         has_conflict=len(conflicts) > 0,
         conflicts=conflict_items,
@@ -795,6 +797,24 @@ def export_freeze_rules(
         "count": len(data),
         "data": data,
     }
+
+
+@app.post("/freeze-rules/{rule_id}/revalidate", tags=["冻结日历"])
+def revalidate_freeze_rule(
+    rule_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    _check_freeze_manage_permission(db, operator_id)
+    rule = services.get_freeze_rule(db, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="冻结规则不存在")
+    return services.revalidate_after_freeze_change(db, rule, operator_id, "manual")
+
+
+def _check_freeze_manage_permission(db: Session, operator_id: int):
+    if not services.user_can_approve(db, operator_id):
+        raise HTTPException(status_code=403, detail="只有审批角色可以管理冻结规则")
 
 
 @app.post("/freeze-rules/import", response_model=schemas.FreezeImportResult, tags=["冻结日历导入导出"])

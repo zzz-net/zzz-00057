@@ -2746,31 +2746,208 @@ def _check_freeze_manage_permission(db: Session, operator_id: int) -> bool:
     return True
 
 
-def _combine_datetime_from_str(d: date, time_str: Optional[str]) -> Optional[datetime]:
-    if not time_str:
-        return None
-    try:
-        h, m = map(int, time_str.split(":"))
-        return datetime(d.year, d.month, d.day, h, m)
-    except ValueError:
-        return None
+def _parse_time_to_minutes(time_str: str) -> int:
+    h, m = map(int, time_str.split(":"))
+    return h * 60 + m
 
 
-def _time_in_range(check_time: datetime, start_str: Optional[str], end_str: Optional[str]) -> bool:
-    if not start_str or not end_str:
+def _intervals_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return a_start < b_end and a_end > b_start
+
+
+def _check_daily_time_overlap_exact(
+    check_start: datetime,
+    check_end: datetime,
+    rule_start_minutes: Optional[int],
+    rule_end_minutes: Optional[int],
+) -> bool:
+    if rule_start_minutes is None or rule_end_minutes is None:
         return True
-    try:
-        sh, sm = map(int, start_str.split(":"))
-        eh, em = map(int, end_str.split(":"))
-        check_minutes = check_time.hour * 60 + check_time.minute
-        start_minutes = sh * 60 + sm
-        end_minutes = eh * 60 + em
-        if end_minutes > start_minutes:
-            return start_minutes <= check_minutes < end_minutes
+
+    cross_day = rule_end_minutes <= rule_start_minutes
+
+    current_date = check_start.date()
+    end_date = check_end.date()
+    if check_end == datetime(end_date.year, end_date.month, end_date.day, 0, 0) and end_date > current_date:
+        end_date -= timedelta(days=1)
+
+    while current_date <= end_date:
+        if cross_day:
+            seg_m_start = datetime(current_date.year, current_date.month, current_date.day, 0, 0)
+            seg_m_end = datetime(current_date.year, current_date.month, current_date.day,
+                                 rule_end_minutes // 60, rule_end_minutes % 60)
+            seg_e_start = datetime(current_date.year, current_date.month, current_date.day,
+                                   rule_start_minutes // 60, rule_start_minutes % 60)
+            next_day = current_date + timedelta(days=1)
+            seg_e_end = datetime(next_day.year, next_day.month, next_day.day, 0, 0)
+
+            if _intervals_overlap(check_start, check_end, seg_m_start, seg_m_end) or \
+               _intervals_overlap(check_start, check_end, seg_e_start, seg_e_end):
+                return True
         else:
-            return check_minutes >= start_minutes or check_minutes < end_minutes
-    except ValueError:
-        return True
+            seg_start = datetime(current_date.year, current_date.month, current_date.day,
+                                 rule_start_minutes // 60, rule_start_minutes % 60)
+            seg_end = datetime(current_date.year, current_date.month, current_date.day,
+                               rule_end_minutes // 60, rule_end_minutes % 60)
+
+            if _intervals_overlap(check_start, check_end, seg_start, seg_end):
+                return True
+
+        current_date += timedelta(days=1)
+
+    return False
+
+
+def _classify_overlap_type(
+    check_start: datetime,
+    check_end: datetime,
+    rule: models.FreezeRule,
+) -> str:
+    if not rule.start_time or not rule.end_time:
+        return "FULL_DAY"
+
+    rule_start_min = _parse_time_to_minutes(rule.start_time)
+    rule_end_min = _parse_time_to_minutes(rule.end_time)
+    cross_day = rule_end_min <= rule_start_min
+
+    if cross_day:
+        return "CROSS_DAY"
+
+    check_start_min = check_start.hour * 60 + check_start.minute
+    check_end_min = check_end.hour * 60 + check_end.minute
+
+    same_day = check_start.date() == check_end.date() or \
+        check_end == datetime(check_end.year, check_end.month, check_end.day, 0, 0)
+
+    if same_day:
+        if check_start_min >= rule_start_min and check_end_min <= rule_end_min:
+            if check_start_min == rule_start_min and check_end_min == rule_end_min:
+                return "EXACT_MATCH"
+            return "NESTED"
+        if check_start_min < rule_end_min and check_end_min > rule_start_min:
+            return "PARTIAL"
+
+    return "PARTIAL"
+
+
+def _detect_rule_time_overlaps(
+    db: Session,
+    environment_id: int,
+    date_from: datetime,
+    date_to: datetime,
+    start_time: Optional[str],
+    end_time: Optional[str],
+    freeze_scope: models.FreezeRuleScope,
+    exclude_rule_id: Optional[int] = None,
+) -> List[dict]:
+    q = db.query(models.FreezeRule).filter(
+        models.FreezeRule.environment_id == environment_id,
+        models.FreezeRule.status == models.FreezeRuleStatus.ACTIVE,
+    )
+    if exclude_rule_id is not None:
+        q = q.filter(models.FreezeRule.id != exclude_rule_id)
+
+    all_rules = q.all()
+    overlaps = []
+
+    rule_start_min = _parse_time_to_minutes(start_time) if start_time else None
+    rule_end_min = _parse_time_to_minutes(end_time) if end_time else None
+
+    for existing in all_rules:
+        if existing.date_from >= date_to or existing.date_to <= date_from:
+            continue
+
+        scope_overlap = (existing.freeze_scope == models.FreezeRuleScope.ALL or
+                         freeze_scope == models.FreezeRuleScope.ALL or
+                         existing.freeze_scope == freeze_scope)
+        if not scope_overlap:
+            continue
+
+        has_time_overlap = False
+
+        if rule_start_min is None or rule_end_min is None:
+            if existing.start_time and existing.end_time:
+                has_time_overlap = _check_daily_time_overlap_exact(
+                    existing.date_from, existing.date_to, rule_start_min, rule_end_min
+                )
+            else:
+                has_time_overlap = True
+        elif existing.start_time and existing.end_time:
+            ex_start_min = _parse_time_to_minutes(existing.start_time)
+            ex_end_min = _parse_time_to_minutes(existing.end_time)
+
+            overlap_dates_start = max(existing.date_from, date_from)
+            overlap_dates_end = min(existing.date_to, date_to)
+            current = overlap_dates_start.date()
+            end_d = overlap_dates_end.date()
+
+            while current <= end_d:
+                cross_day = rule_end_min <= rule_start_min
+                if not cross_day:
+                    r_seg_s = datetime(current.year, current.month, current.day,
+                                       rule_start_min // 60, rule_start_min % 60)
+                    r_seg_e = datetime(current.year, current.month, current.day,
+                                       rule_end_min // 60, rule_end_min % 60)
+                else:
+                    r_seg_s = datetime(current.year, current.month, current.day,
+                                       rule_start_min // 60, rule_start_min % 60)
+                    next_d = current + timedelta(days=1)
+                    r_seg_e = datetime(next_d.year, next_d.month, next_d.day,
+                                       rule_end_min // 60, rule_end_min % 60)
+
+                ex_cross = ex_end_min <= ex_start_min
+                if not ex_cross:
+                    e_seg_s = datetime(current.year, current.month, current.day,
+                                       ex_start_min // 60, ex_start_min % 60)
+                    e_seg_e = datetime(current.year, current.month, current.day,
+                                       ex_end_min // 60, ex_end_min % 60)
+                else:
+                    e_seg_s = datetime(current.year, current.month, current.day,
+                                       ex_start_min // 60, ex_start_min % 60)
+                    next_d2 = current + timedelta(days=1)
+                    e_seg_e = datetime(next_d2.year, next_d2.month, next_d2.day,
+                                       ex_end_min // 60, ex_end_min % 60)
+
+                if _intervals_overlap(r_seg_s, r_seg_e, e_seg_s, e_seg_e):
+                    has_time_overlap = True
+                    break
+
+                current += timedelta(days=1)
+        else:
+            has_time_overlap = True
+
+        if has_time_overlap:
+            overlap_type = "DUPLICATE"
+            if (existing.start_time == start_time and existing.end_time == end_time and
+                    abs((existing.date_from - date_from).total_seconds()) < 86400 and
+                    abs((existing.date_to - date_to).total_seconds()) < 86400):
+                overlap_type = "DUPLICATE"
+            elif start_time and end_time and existing.start_time and existing.end_time:
+                r_s = _parse_time_to_minutes(start_time)
+                r_e = _parse_time_to_minutes(end_time)
+                e_s = _parse_time_to_minutes(existing.start_time)
+                e_e = _parse_time_to_minutes(existing.end_time)
+                if r_e > r_s and e_e > e_s:
+                    if r_s >= e_s and r_e <= e_e:
+                        overlap_type = "NESTED"
+                    elif e_s >= r_s and e_e <= r_e:
+                        overlap_type = "CONTAINS"
+                    else:
+                        overlap_type = "PARTIAL"
+                elif r_e <= r_s or e_e <= e_s:
+                    overlap_type = "CROSS_DAY"
+            overlaps.append({
+                "rule_id": existing.id,
+                "rule_name": existing.name,
+                "rule_scope": existing.freeze_scope.value if existing.freeze_scope else "ALL",
+                "rule_date_from": existing.date_from.isoformat() if existing.date_from else None,
+                "rule_date_to": existing.date_to.isoformat() if existing.date_to else None,
+                "rule_start_time": existing.start_time,
+                "rule_end_time": existing.end_time,
+                "overlap_type": overlap_type,
+            })
+
+    return overlaps
 
 
 def check_freeze_conflicts(
@@ -2784,35 +2961,29 @@ def check_freeze_conflicts(
     q = db.query(models.FreezeRule).filter(
         models.FreezeRule.environment_id == environment_id,
         models.FreezeRule.status == models.FreezeRuleStatus.ACTIVE,
-        models.FreezeRule.date_from < end_time,
-        models.FreezeRule.date_to > start_time,
     )
     if exclude_rule_id is not None:
         q = q.filter(models.FreezeRule.id != exclude_rule_id)
-    
+
     all_rules = q.all()
     matching_rules = []
-    
+
     for rule in all_rules:
         rule_scope = rule.freeze_scope
         if rule_scope != models.FreezeRuleScope.ALL and rule_scope != scope:
             continue
-        
-        if rule.start_time and rule.end_time:
-            has_overlap = False
-            current = start_time
-            while current < end_time:
-                if _time_in_range(current, rule.start_time, rule.end_time):
-                    has_overlap = True
-                    break
-                current += timedelta(minutes=30)
-                if current > end_time:
-                    current = end_time
-            if not has_overlap:
-                continue
-        
+
+        if rule.date_from >= end_time or rule.date_to <= start_time:
+            continue
+
+        rule_start_min = _parse_time_to_minutes(rule.start_time) if rule.start_time else None
+        rule_end_min = _parse_time_to_minutes(rule.end_time) if rule.end_time else None
+
+        if not _check_daily_time_overlap_exact(start_time, end_time, rule_start_min, rule_end_min):
+            continue
+
         matching_rules.append(rule)
-    
+
     return matching_rules
 
 
@@ -2848,35 +3019,40 @@ def create_freeze_rule(
     db: Session, rule_in: schemas.FreezeRuleCreate
 ) -> models.FreezeRule:
     _check_freeze_manage_permission(db, rule_in.creator_id)
-    
+
     env = get_environment(db, rule_in.environment_id)
     if not env:
         raise BusinessError(f"环境 ID={rule_in.environment_id} 不存在", 404)
-    
+
     creator = get_user(db, rule_in.creator_id)
     if not creator:
         raise BusinessError(f"创建人 ID={rule_in.creator_id} 不存在", 404)
-    
+
     if rule_in.date_to <= rule_in.date_from:
         raise BusinessError("冻结结束时间必须晚于开始时间")
-    
+
     if rule_in.start_time and rule_in.end_time:
         try:
             sh, sm = map(int, rule_in.start_time.split(":"))
             eh, em = map(int, rule_in.end_time.split(":"))
         except ValueError:
             raise BusinessError("时间格式不正确，应为 HH:MM")
-    
+
     existing = db.query(models.FreezeRule).filter(
         models.FreezeRule.name == rule_in.name,
         models.FreezeRule.environment_id == rule_in.environment_id,
     ).first()
     if existing:
         raise BusinessError(f"同一环境下冻结规则名称 '{rule_in.name}' 已存在")
-    
+
     scope_map = {s.value: s for s in models.FreezeRuleScope}
     freeze_scope = scope_map.get(rule_in.freeze_scope, models.FreezeRuleScope.ALL)
-    
+
+    overlap_warnings = _detect_rule_time_overlaps(
+        db, rule_in.environment_id, rule_in.date_from, rule_in.date_to,
+        rule_in.start_time, rule_in.end_time, freeze_scope,
+    )
+
     db_rule = models.FreezeRule(
         name=rule_in.name,
         description=rule_in.description,
@@ -2893,12 +3069,13 @@ def create_freeze_rule(
     )
     db.add(db_rule)
     db.flush()
-    
+
     _add_freeze_audit_log(
         db, db_rule, models.FreezeAction.FREEZE_CREATE, rule_in.creator_id,
-        detail=f"创建冻结规则: {rule_in.name}",
+        detail=f"创建冻结规则: {rule_in.name}" +
+               (f"，检测到{len(overlap_warnings)}条重叠规则" if overlap_warnings else ""),
     )
-    
+
     db.commit()
     db.refresh(db_rule)
     return db_rule
@@ -2928,13 +3105,13 @@ def update_freeze_rule(
     db: Session, rule_id: int, rule_in: schemas.FreezeRuleUpdate, operator_id: int
 ) -> models.FreezeRule:
     _check_freeze_manage_permission(db, operator_id)
-    
+
     db_rule = get_freeze_rule(db, rule_id)
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
-    
+
     update_data = rule_in.model_dump(exclude_unset=True)
-    
+
     if "name" in update_data:
         existing = db.query(models.FreezeRule).filter(
             models.FreezeRule.name == update_data["name"],
@@ -2943,33 +3120,45 @@ def update_freeze_rule(
         ).first()
         if existing:
             raise BusinessError(f"同一环境下冻结规则名称 '{update_data['name']}' 已存在")
-    
+
     if "environment_id" in update_data:
         env = get_environment(db, update_data["environment_id"])
         if not env:
             raise BusinessError(f"环境 ID={update_data['environment_id']} 不存在", 404)
-    
+
     new_date_from = update_data.get("date_from", db_rule.date_from)
     new_date_to = update_data.get("date_to", db_rule.date_to)
     if new_date_to <= new_date_from:
         raise BusinessError("冻结结束时间必须晚于开始时间")
-    
+
     if "freeze_scope" in update_data:
         scope_map = {s.value: s for s in models.FreezeRuleScope}
         update_data["freeze_scope"] = scope_map.get(
             update_data["freeze_scope"], models.FreezeRuleScope.ALL
         )
-    
+
+    new_start_time = update_data.get("start_time", db_rule.start_time)
+    new_end_time = update_data.get("end_time", db_rule.end_time)
+    new_env_id = update_data.get("environment_id", db_rule.environment_id)
+    new_scope = update_data.get("freeze_scope", db_rule.freeze_scope)
+
+    overlap_warnings = _detect_rule_time_overlaps(
+        db, new_env_id, new_date_from, new_date_to,
+        new_start_time, new_end_time, new_scope,
+        exclude_rule_id=rule_id,
+    )
+
     for k, v in update_data.items():
         setattr(db_rule, k, v)
-    
+
     db_rule.updated_at = datetime.utcnow()
-    
+
     _add_freeze_audit_log(
         db, db_rule, models.FreezeAction.FREEZE_UPDATE, operator_id,
-        detail=f"更新冻结规则: {db_rule.name}",
+        detail=f"更新冻结规则: {db_rule.name}" +
+               (f"，检测到{len(overlap_warnings)}条重叠规则" if overlap_warnings else ""),
     )
-    
+
     db.commit()
     db.refresh(db_rule)
     return db_rule
@@ -2990,20 +3179,22 @@ def activate_freeze_rule(
     db: Session, rule_id: int, operator_id: int
 ) -> models.FreezeRule:
     _check_freeze_manage_permission(db, operator_id)
-    
+
     db_rule = get_freeze_rule(db, rule_id)
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
-    
+
     old_status = db_rule.status
     db_rule.status = models.FreezeRuleStatus.ACTIVE
     db_rule.updated_at = datetime.utcnow()
-    
+
     _add_freeze_audit_log(
         db, db_rule, models.FreezeAction.FREEZE_ACTIVATE, operator_id,
         detail=f"启用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
     )
-    
+
+    revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "activate")
+
     db.commit()
     db.refresh(db_rule)
     return db_rule
@@ -3013,23 +3204,129 @@ def deactivate_freeze_rule(
     db: Session, rule_id: int, operator_id: int
 ) -> models.FreezeRule:
     _check_freeze_manage_permission(db, operator_id)
-    
+
     db_rule = get_freeze_rule(db, rule_id)
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
-    
+
     old_status = db_rule.status
     db_rule.status = models.FreezeRuleStatus.INACTIVE
     db_rule.updated_at = datetime.utcnow()
-    
+
     _add_freeze_audit_log(
         db, db_rule, models.FreezeAction.FREEZE_DEACTIVATE, operator_id,
         detail=f"停用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
     )
-    
+
+    revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "deactivate")
+
     db.commit()
     db.refresh(db_rule)
     return db_rule
+
+
+def revalidate_after_freeze_change(
+    db: Session,
+    rule: models.FreezeRule,
+    operator_id: int,
+    action: str,
+) -> dict:
+    result = {
+        "rule_id": rule.id,
+        "rule_name": rule.name,
+        "action": action,
+        "affected_plans": [],
+        "affected_windows": [],
+    }
+
+    env_id = rule.environment_id
+
+    plans = db.query(models.SchedulePlan).filter(
+        models.SchedulePlan.environment_id == env_id,
+        models.SchedulePlan.status.in_([
+            models.PlanStatus.APPROVED,
+            models.PlanStatus.CONFIRMING,
+            models.PlanStatus.CONFIRMED,
+        ]),
+    ).all()
+
+    for plan in plans:
+        affected_items = []
+        for item in plan.items:
+            if item.status in [models.PlanItemStatus.EXCLUDED, models.PlanItemStatus.CREATED]:
+                continue
+
+            item_date = date.fromisoformat(item.date)
+            start_dt = _combine_datetime(item_date, item.start_time)
+            end_dt = _combine_datetime(item_date, item.end_time)
+
+            if action == "activate":
+                conflicts = check_freeze_conflicts(
+                    db, env_id, start_dt, end_dt,
+                    models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
+                )
+                scope_conflicts = [c for c in conflicts if c.id == rule.id]
+                if scope_conflicts:
+                    affected_items.append({
+                        "item_id": item.id,
+                        "date": item.date,
+                        "conflict": True,
+                    })
+
+            elif action == "deactivate":
+                remaining_conflicts = check_freeze_conflicts(
+                    db, env_id, start_dt, end_dt,
+                    models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
+                )
+                if not remaining_conflicts:
+                    affected_items.append({
+                        "item_id": item.id,
+                        "date": item.date,
+                        "conflict": False,
+                        "can_proceed": True,
+                    })
+
+        if affected_items:
+            result["affected_plans"].append({
+                "plan_id": plan.id,
+                "plan_name": plan.name,
+                "plan_status": plan.status.value,
+                "items": affected_items,
+            })
+
+            if action == "deactivate":
+                for ai in affected_items:
+                    if ai.get("can_proceed"):
+                        plan_item = db.query(models.SchedulePlanItem).filter(
+                            models.SchedulePlanItem.id == ai["item_id"]
+                        ).first()
+                        if plan_item and plan_item.status == models.PlanItemStatus.CHANGED:
+                            plan_item.status = models.PlanItemStatus.APPROVED
+                            plan_item.current_diff_type = None
+                            plan_item.current_diff_detail = None
+                            plan_item.updated_at = datetime.utcnow()
+
+    windows = db.query(models.MaintenanceWindow).filter(
+        models.MaintenanceWindow.environment_id == env_id,
+        models.MaintenanceWindow.status.in_([
+            WindowStatus.DRAFT,
+        ]),
+    ).all()
+
+    for win in windows:
+        if action == "deactivate":
+            remaining = check_freeze_conflicts(
+                db, env_id, win.start_time, win.end_time,
+                models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
+            )
+            if not remaining:
+                result["affected_windows"].append({
+                    "window_id": win.id,
+                    "title": win.title,
+                    "can_proceed": True,
+                })
+
+    return result
 
 
 def get_freeze_audit_logs(
@@ -3040,7 +3337,7 @@ def get_freeze_audit_logs(
     ).order_by(models.FreezeAuditLog.created_at.desc()).all()
 
 
-def _build_freeze_conflict_reason(rule: models.FreezeRule, scope: str) -> str:
+def _build_freeze_conflict_reason(rule: models.FreezeRule, scope: str, check_start: Optional[datetime] = None, check_end: Optional[datetime] = None) -> str:
     reason_parts = []
     reason_parts.append(f"冻结规则「{rule.name}」")
     if rule.reason:
@@ -3048,6 +3345,10 @@ def _build_freeze_conflict_reason(rule: models.FreezeRule, scope: str) -> str:
     reason_parts.append(f"禁止{scope}操作")
     if rule.start_time and rule.end_time:
         reason_parts.append(f"，每日 {rule.start_time}-{rule.end_time}")
+    if check_start and check_end:
+        overlap_type = _classify_overlap_type(check_start, check_end, rule)
+        if overlap_type != "PARTIAL":
+            reason_parts.append(f"，重叠类型={overlap_type}")
     return "".join(reason_parts)
 
 
@@ -3063,21 +3364,22 @@ def check_window_freeze_and_raise(
     conflicts = check_freeze_conflicts(db, environment_id, start_time, end_time, scope)
     if not conflicts:
         return
-    
+
     for rule in conflicts:
         _add_freeze_audit_log(
             db, rule, models.FreezeAction.FREEZE_HIT_WINDOW, operator_id,
-            detail=_build_freeze_conflict_reason(rule, scope.value),
+            detail=_build_freeze_conflict_reason(rule, scope.value, start_time, end_time),
             target_window_id=window_id,
         )
-    
+
     db.commit()
-    
+
     conflict_descs = []
     for rule in conflicts:
-        desc = f"[{rule.name}] {rule.reason or '冻结期'}"
+        overlap_type = _classify_overlap_type(start_time, end_time, rule)
+        desc = f"[{rule.name}] {rule.reason or '冻结期'} (重叠类型={overlap_type})"
         conflict_descs.append(desc)
-    
+
     raise BusinessError(
         f"操作被冻结规则拦截: {'; '.join(conflict_descs)}",
         403,
@@ -3093,20 +3395,21 @@ def check_plan_freeze_for_items(
     operator_id: int,
 ) -> List[dict]:
     conflicts_info = []
-    
+
     for item in items:
         if item.status == models.PlanItemStatus.EXCLUDED:
             continue
         item_date = date.fromisoformat(item.date)
         start_dt = _combine_datetime(item_date, item.start_time)
         end_dt = _combine_datetime(item_date, item.end_time)
-        
+
         conflicts = check_freeze_conflicts(db, environment_id, start_dt, end_dt, scope)
-        
+
         for rule in conflicts:
+            overlap_type = _classify_overlap_type(start_dt, end_dt, rule)
             _add_freeze_audit_log(
                 db, rule, models.FreezeAction.FREEZE_HIT_PLAN, operator_id,
-                detail=_build_freeze_conflict_reason(rule, scope.value),
+                detail=_build_freeze_conflict_reason(rule, scope.value, start_dt, end_dt),
                 target_plan_id=plan_id,
                 target_item_id=item.id,
             )
@@ -3117,12 +3420,13 @@ def check_plan_freeze_for_items(
                 "rule_name": rule.name,
                 "freeze_scope": rule.freeze_scope.value if rule.freeze_scope else None,
                 "reason": rule.reason,
-                "conflict_reason": _build_freeze_conflict_reason(rule, scope.value),
+                "overlap_type": overlap_type,
+                "conflict_reason": _build_freeze_conflict_reason(rule, scope.value, start_dt, end_dt),
             })
-    
+
     if conflicts_info:
         db.commit()
-    
+
     return conflicts_info
 
 
