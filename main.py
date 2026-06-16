@@ -812,6 +812,89 @@ def revalidate_freeze_rule(
     return services.revalidate_after_freeze_change(db, rule, operator_id, "manual")
 
 
+@app.post("/freeze-rules/{rule_id}/revoke", response_model=schemas.FreezeRecoveryResult, tags=["冻结规则影响恢复中心"])
+def revoke_freeze_rule(
+    rule_id: int,
+    req: schemas.FreezeRevokeRequest,
+    db: Session = Depends(get_db),
+):
+    return services.revoke_freeze_rule(db, rule_id, req.operator_id, req.reason)
+
+
+@app.get("/freeze-hit-records", tags=["冻结规则影响恢复中心"])
+def list_freeze_hit_records(
+    rule_id: Optional[int] = Query(None, description="冻结规则ID"),
+    plan_id: Optional[int] = Query(None, description="排期方案ID"),
+    status: Optional[str] = Query(None, description="状态 (ACTIVE/RECOVERED/REVOKED)"),
+    db: Session = Depends(get_db),
+):
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.FreezeHitRecordStatus(status)
+        except ValueError:
+            pass
+    records = services.get_freeze_hit_records(db, rule_id, plan_id, status_enum)
+    result = []
+    for r in records:
+        result.append({
+            "id": r.id,
+            "rule_id": r.rule_id,
+            "rule_name": r.rule_name,
+            "plan_id": r.plan_id,
+            "item_id": r.item_id,
+            "item_date": r.item_date,
+            "item_start_time": r.item_start_time,
+            "item_end_time": r.item_end_time,
+            "item_status_before": r.item_status_before,
+            "freeze_scope": r.freeze_scope.value if r.freeze_scope else "ALL",
+            "hit_reason": r.hit_reason,
+            "overlap_type": r.overlap_type,
+            "status": r.status.value if r.status else "ACTIVE",
+            "operator_id": r.operator_id,
+            "recovered_at": r.recovered_at.isoformat() if r.recovered_at else None,
+            "recovered_by": r.recovered_by,
+            "recovery_reason": r.recovery_reason,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        })
+    return result
+
+
+@app.get("/freeze-recovery-logs", tags=["冻结规则影响恢复中心"])
+def list_freeze_recovery_logs(
+    rule_id: Optional[int] = Query(None, description="冻结规则ID"),
+    plan_id: Optional[int] = Query(None, description="排期方案ID"),
+    db: Session = Depends(get_db),
+):
+    logs = services.get_freeze_recovery_logs(db, rule_id, plan_id)
+    result = []
+    for log in logs:
+        operator = log.operator
+        result.append({
+            "id": log.id,
+            "rule_id": log.rule_id,
+            "rule_name": log.rule_name,
+            "trigger_action": log.trigger_action,
+            "plan_id": log.plan_id,
+            "item_id": log.item_id,
+            "item_date": log.item_date,
+            "status_before": log.status_before,
+            "status_after": log.status_after,
+            "still_blocked_by_rule_ids": log.still_blocked_by_rule_ids,
+            "operator_id": log.operator_id,
+            "operator_username": operator.username if operator else None,
+            "detail": log.detail,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        })
+    return result
+
+
+@app.get("/freeze-recovery-center/summary", response_model=schemas.FreezeRecoveryCenterSummary, tags=["冻结规则影响恢复中心"])
+def get_recovery_center_summary(db: Session = Depends(get_db)):
+    return services.get_recovery_center_summary(db)
+
+
 def _check_freeze_manage_permission(db: Session, operator_id: int):
     if not services.user_can_approve(db, operator_id):
         raise HTTPException(status_code=403, detail="只有审批角色可以管理冻结规则")

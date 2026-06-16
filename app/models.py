@@ -322,6 +322,8 @@ class PlanAction(str, enum.Enum):
     PLAN_CANCEL = "PLAN_CANCEL"
     PLAN_IMPORT = "PLAN_IMPORT"
     PLAN_EXPORT = "PLAN_EXPORT"
+    PLAN_FREEZE_HIT = "PLAN_FREEZE_HIT"
+    PLAN_FREEZE_RECOVER = "PLAN_FREEZE_RECOVER"
 
 
 class PlanAuditLog(Base):
@@ -364,6 +366,8 @@ class FreezeAction(str, enum.Enum):
     FREEZE_HIT_PLAN = "FREEZE_HIT_PLAN"
     FREEZE_IMPORT = "FREEZE_IMPORT"
     FREEZE_EXPORT = "FREEZE_EXPORT"
+    FREEZE_REVOKE = "FREEZE_REVOKE"
+    FREEZE_RECOVER = "FREEZE_RECOVER"
 
 
 class FreezeRule(Base):
@@ -405,4 +409,60 @@ class FreezeAuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     rule = relationship("FreezeRule", back_populates="audit_logs")
+    operator = relationship("User", foreign_keys=[operator_id])
+
+
+class FreezeHitRecordStatus(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    RECOVERED = "RECOVERED"
+    REVOKED = "REVOKED"
+
+
+class FreezeHitRecord(Base):
+    __tablename__ = "freeze_hit_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, ForeignKey("freeze_rules.id"), nullable=False)
+    rule_name = Column(String(200), nullable=False)
+    plan_id = Column(Integer, ForeignKey("schedule_plans.id"), nullable=False)
+    item_id = Column(Integer, ForeignKey("schedule_plan_items.id"), nullable=False)
+    item_date = Column(String(10), nullable=False)
+    item_start_time = Column(String(5), nullable=False)
+    item_end_time = Column(String(5), nullable=False)
+    item_status_before = Column(String(30), nullable=True)
+    freeze_scope = Column(Enum(FreezeRuleScope), default=FreezeRuleScope.ALL, nullable=False)
+    hit_reason = Column(Text, nullable=True)
+    overlap_type = Column(String(20), nullable=True)
+    status = Column(Enum(FreezeHitRecordStatus), default=FreezeHitRecordStatus.ACTIVE, nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recovered_at = Column(DateTime, nullable=True)
+    recovered_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    recovery_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    rule = relationship("FreezeRule")
+    plan = relationship("SchedulePlan")
+    item = relationship("SchedulePlanItem")
+    operator = relationship("User", foreign_keys=[operator_id])
+    recoverer = relationship("User", foreign_keys=[recovered_by])
+
+
+class FreezeRecoveryLog(Base):
+    __tablename__ = "freeze_recovery_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, nullable=False)
+    rule_name = Column(String(200), nullable=False)
+    trigger_action = Column(String(30), nullable=False)
+    plan_id = Column(Integer, nullable=False)
+    item_id = Column(Integer, nullable=False)
+    item_date = Column(String(10), nullable=False)
+    status_before = Column(String(30), nullable=True)
+    status_after = Column(String(30), nullable=True)
+    still_blocked_by_rule_ids = Column(Text, nullable=True)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
     operator = relationship("User", foreign_keys=[operator_id])

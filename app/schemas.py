@@ -888,3 +888,71 @@ class FreezeImportResult(BaseModel):
     skipped: int
     failed: int
     details: List[dict]
+
+
+# ============== Freeze Recovery Center Schemas ==============
+
+class FreezeHitRecordOut(BaseModel):
+    id: int
+    rule_id: int
+    rule_name: str
+    plan_id: int
+    item_id: int
+    item_date: str
+    item_start_time: str
+    item_end_time: str
+    item_status_before: Optional[str] = None
+    freeze_scope: str
+    hit_reason: Optional[str] = None
+    overlap_type: Optional[str] = None
+    status: str
+    operator_id: int
+    recovered_at: Optional[datetime] = None
+    recovered_by: Optional[int] = None
+    recovery_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeRecoveryLogOut(BaseModel):
+    id: int
+    rule_id: int
+    rule_name: str
+    trigger_action: str
+    plan_id: int
+    item_id: int
+    item_date: str
+    status_before: Optional[str] = None
+    status_after: Optional[str] = None
+    still_blocked_by_rule_ids: Optional[str] = None
+    operator_id: int
+    detail: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeRevokeRequest(BaseModel):
+    operator_id: int
+    reason: Optional[str] = None
+
+
+class FreezeRecoveryResult(BaseModel):
+    rule_id: int
+    rule_name: str
+    action: str
+    recovered_items: int
+    still_blocked_items: int
+    details: List[dict]
+
+
+class FreezeRecoveryCenterSummary(BaseModel):
+    total_active_hits: int
+    total_recovered: int
+    total_still_blocked: int
+    by_rule: List[dict]
+    by_plan: List[dict]
