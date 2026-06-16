@@ -724,6 +724,11 @@ class PlanImportItem(BaseModel):
     status: str
     approval_reason: Optional[str] = None
     items: List[PlanItemExport] = []
+    confirmations: Optional[List[dict]] = None
+    audit_logs: Optional[List[dict]] = None
+    creator_username: Optional[str] = None
+    approver_username: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class PlanImportRequest(BaseModel):

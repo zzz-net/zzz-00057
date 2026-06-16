@@ -1725,11 +1725,20 @@ def detect_plan_changes(
     current_slots_snapshot = json.loads(_snapshot_environment_slots(db, plan.environment_id))
     original_slots_snapshot = json.loads(plan.environment_slots_snapshot)
     
-    template_changed = (
+    template_time_changed = (
         current_template_snapshot["start_time"] != original_template_snapshot["start_time"] or
         current_template_snapshot["end_time"] != original_template_snapshot["end_time"] or
         current_template_snapshot["environment_id"] != original_template_snapshot["environment_id"]
     )
+    
+    template_meta_changed = (
+        current_template_snapshot.get("description") != original_template_snapshot.get("description") or
+        current_template_snapshot.get("change_reason") != original_template_snapshot.get("change_reason") or
+        current_template_snapshot.get("is_shared") != original_template_snapshot.get("is_shared") or
+        current_template_snapshot.get("name") != original_template_snapshot.get("name")
+    )
+    
+    template_changed = template_time_changed or template_meta_changed
     
     slots_changed = current_slots_snapshot != original_slots_snapshot
     
@@ -1748,18 +1757,45 @@ def detect_plan_changes(
         
         if template_changed:
             current_diff_type = models.DiffType.TEMPLATE_CHANGED
-            diff_hints.append({
+            template_diff_hint = {
                 "diff_type": models.DiffType.TEMPLATE_CHANGED.value,
                 "detail": "模板内容已变更",
-                "old_value": {
-                    "start_time": original_template_snapshot["start_time"],
-                    "end_time": original_template_snapshot["end_time"],
-                },
-                "new_value": {
-                    "start_time": current_template_snapshot["start_time"],
-                    "end_time": current_template_snapshot["end_time"],
-                },
-            })
+                "changed_fields": [],
+                "old_value": {},
+                "new_value": {},
+            }
+            if template_time_changed:
+                if current_template_snapshot["start_time"] != original_template_snapshot["start_time"]:
+                    template_diff_hint["changed_fields"].append("start_time")
+                    template_diff_hint["old_value"]["start_time"] = original_template_snapshot["start_time"]
+                    template_diff_hint["new_value"]["start_time"] = current_template_snapshot["start_time"]
+                if current_template_snapshot["end_time"] != original_template_snapshot["end_time"]:
+                    template_diff_hint["changed_fields"].append("end_time")
+                    template_diff_hint["old_value"]["end_time"] = original_template_snapshot["end_time"]
+                    template_diff_hint["new_value"]["end_time"] = current_template_snapshot["end_time"]
+                if current_template_snapshot["environment_id"] != original_template_snapshot["environment_id"]:
+                    template_diff_hint["changed_fields"].append("environment_id")
+                    template_diff_hint["old_value"]["environment_id"] = original_template_snapshot["environment_id"]
+                    template_diff_hint["new_value"]["environment_id"] = current_template_snapshot["environment_id"]
+            if template_meta_changed:
+                if current_template_snapshot.get("description") != original_template_snapshot.get("description"):
+                    template_diff_hint["changed_fields"].append("description")
+                    template_diff_hint["old_value"]["description"] = original_template_snapshot.get("description")
+                    template_diff_hint["new_value"]["description"] = current_template_snapshot.get("description")
+                if current_template_snapshot.get("change_reason") != original_template_snapshot.get("change_reason"):
+                    template_diff_hint["changed_fields"].append("change_reason")
+                    template_diff_hint["old_value"]["change_reason"] = original_template_snapshot.get("change_reason")
+                    template_diff_hint["new_value"]["change_reason"] = current_template_snapshot.get("change_reason")
+                if current_template_snapshot.get("is_shared") != original_template_snapshot.get("is_shared"):
+                    template_diff_hint["changed_fields"].append("is_shared")
+                    template_diff_hint["old_value"]["is_shared"] = original_template_snapshot.get("is_shared")
+                    template_diff_hint["new_value"]["is_shared"] = current_template_snapshot.get("is_shared")
+                if current_template_snapshot.get("name") != original_template_snapshot.get("name"):
+                    template_diff_hint["changed_fields"].append("name")
+                    template_diff_hint["old_value"]["name"] = original_template_snapshot.get("name")
+                    template_diff_hint["new_value"]["name"] = current_template_snapshot.get("name")
+                template_diff_hint["detail"] = f"模板关键字段已变更: {', '.join(template_diff_hint['changed_fields'])}"
+            diff_hints.append(template_diff_hint)
         
         if slots_changed:
             current_diff_type = models.DiffType.SLOT_CHANGED
@@ -2008,6 +2044,20 @@ def confirm_schedule_plan(
     
     if plan.status not in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMING]:
         raise BusinessError(f"当前状态 {plan.status.value} 不能确认")
+    
+    if plan.status == models.PlanStatus.APPROVED:
+        _ = detect_plan_changes(db, plan_id, req.operator_id)
+    
+    changed_items = [
+        item for item in plan.items
+        if item.status == models.PlanItemStatus.CHANGED
+    ]
+    if changed_items:
+        changed_dates = ", ".join([item.date for item in changed_items])
+        raise BusinessError(
+            f"检测到 {len(changed_items)} 条变更未处理（日期: {changed_dates}），"
+            f"请先对变更条目执行重新预检或剔除后再确认。可调用 detect-changes 查看详情。"
+        )
     
     items_to_confirm = []
     if req.item_ids:
@@ -2449,41 +2499,74 @@ def import_schedule_plans(
                     plan.confirmed_count += 1
             
             # 导入确认记录
-            if hasattr(item, 'confirmations') and item.confirmations:
+            if item.confirmations:
                 for conf_data in item.confirmations:
-                    if isinstance(conf_data, dict):
-                        conf_dict = conf_data
-                    else:
-                        conf_dict = conf_data.model_dump()
+                    conf_dict = conf_data if isinstance(conf_data, dict) else conf_data
+                    if not conf_dict:
+                        continue
+                    op_username = conf_dict.get("operator_username")
+                    resolved_operator_id = req.operator_id
+                    if op_username:
+                        op_user = db.query(models.User).filter(
+                            models.User.username == op_username
+                        ).first()
+                        if op_user:
+                            resolved_operator_id = op_user.id
+                    
+                    item_ids_val = None
+                    if conf_dict.get("item_ids"):
+                        item_ids_val = json.dumps(conf_dict["item_ids"], ensure_ascii=False)
+                    excluded_item_ids_val = None
+                    if conf_dict.get("excluded_item_ids"):
+                        excluded_item_ids_val = json.dumps(conf_dict["excluded_item_ids"], ensure_ascii=False)
+                    rechecked_item_ids_val = None
+                    if conf_dict.get("rechecked_item_ids"):
+                        rechecked_item_ids_val = json.dumps(conf_dict["rechecked_item_ids"], ensure_ascii=False)
+                    diff_summary_val = None
+                    if conf_dict.get("diff_summary"):
+                        diff_summary_val = json.dumps(conf_dict["diff_summary"], ensure_ascii=False)
+                    
                     confirmation = models.PlanConfirmation(
                         plan_id=plan.id,
-                        operator_id=conf_dict["operator_id"],
-                        operator_name=conf_dict.get("operator_name"),
+                        operator_id=resolved_operator_id,
+                        confirmation_type=conf_dict.get("confirmation_type", "IMPORTED"),
+                        item_ids=item_ids_val,
+                        excluded_item_ids=excluded_item_ids_val,
+                        rechecked_item_ids=rechecked_item_ids_val,
+                        diff_summary=diff_summary_val,
                         remark=conf_dict.get("remark"),
-                        diff_summary=json.dumps(conf_dict.get("diff_summary", {}), ensure_ascii=False),
-                        confirmed_count=conf_dict.get("confirmed_count", 0),
-                        excluded_count=conf_dict.get("excluded_count", 0),
-                        changed_count=conf_dict.get("changed_count", 0),
                     )
                     db.add(confirmation)
             
             # 导入审计日志
-            if hasattr(item, 'audit_logs') and item.audit_logs:
+            if item.audit_logs:
                 for log_data in item.audit_logs:
-                    if isinstance(log_data, dict):
-                        log_dict = log_data
-                    else:
-                        log_dict = log_data.model_dump()
+                    log_dict = log_data if isinstance(log_data, dict) else log_data
+                    if not log_dict:
+                        continue
                     action_map = {a.value: a for a in models.PlanAction}
-                    log_action = action_map.get(log_dict["action"], models.PlanAction.PLAN_IMPORT)
+                    log_action = action_map.get(log_dict.get("action"), models.PlanAction.PLAN_IMPORT)
+                    
+                    op_username = log_dict.get("operator_username")
+                    resolved_operator_id = req.operator_id
+                    if op_username:
+                        op_user = db.query(models.User).filter(
+                            models.User.username == op_username
+                        ).first()
+                        if op_user:
+                            resolved_operator_id = op_user.id
+                    
+                    snapshot_val = None
+                    if log_dict.get("snapshot"):
+                        snapshot_val = json.dumps(log_dict["snapshot"], ensure_ascii=False)
+                    
                     audit_log = models.PlanAuditLog(
                         plan_id=plan.id,
                         action=log_action,
-                        operator_id=log_dict.get("operator_id", req.operator_id),
-                        operator_name=log_dict.get("operator_name"),
+                        operator_id=resolved_operator_id,
+                        item_id=log_dict.get("item_id"),
                         detail=log_dict.get("detail"),
-                        old_value=json.dumps(log_dict.get("old_value", {}), ensure_ascii=False) if log_dict.get("old_value") else None,
-                        new_value=json.dumps(log_dict.get("new_value", {}), ensure_ascii=False) if log_dict.get("new_value") else None,
+                        snapshot=snapshot_val,
                     )
                     db.add(audit_log)
             
