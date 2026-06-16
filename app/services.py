@@ -2035,47 +2035,108 @@ def recheck_plan_item(
         message=new_message,
     )
     
+    old_status = item.status
+    
     freeze_conflicts = check_freeze_conflicts(
         db, plan.environment_id, start_dt, end_dt, models.FreezeRuleScope.ALL
     )
     
     if freeze_conflicts:
-        freeze_rule = freeze_conflicts[0]
-        freeze_reason = _build_freeze_conflict_reason(freeze_rule, "ALL", start_dt, end_dt)
-        overlap_type = _classify_overlap_type(start_dt, end_dt, freeze_rule)
-        diff_hints = [{
-            "diff_type": "FREEZE_CONFLICT",
-            "detail": freeze_reason,
-            "rule_id": freeze_rule.id,
-            "rule_name": freeze_rule.name,
-            "rule_reason": freeze_rule.reason,
-        }]
+        diff_hints = []
+        for freeze_rule in freeze_conflicts:
+            freeze_reason = _build_freeze_conflict_reason(
+                freeze_rule, "ALL", start_dt, end_dt
+            )
+            overlap_type = _classify_overlap_type(start_dt, end_dt, freeze_rule)
+            diff_hints.append({
+                "diff_type": "FREEZE_CONFLICT",
+                "detail": freeze_reason,
+                "rule_id": freeze_rule.id,
+                "rule_name": freeze_rule.name,
+                "rule_reason": freeze_rule.reason,
+            })
+            record_freeze_hit(
+                db, freeze_rule, plan.id, item, req.operator_id,
+                hit_reason=freeze_reason,
+                overlap_type=overlap_type,
+            )
+        
         item.current_diff_type = models.DiffType.CONFLICT_CHANGED
         item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False)
         item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
         item.status = models.PlanItemStatus.CHANGED
         item.updated_at = datetime.utcnow()
-
-        record_freeze_hit(
-            db, freeze_rule, plan.id, item, req.operator_id,
-            hit_reason=freeze_reason,
-            overlap_type=overlap_type,
-        )
-
-        _add_plan_audit_log(
-            db, plan, models.PlanAction.PLAN_RECHECK, req.operator_id,
-            item_id=item.id,
-            detail=f"重新预检条目 {item.date}: 命中冻结规则 {freeze_rule.name}",
-        )
-
+        
+        if old_status != models.PlanItemStatus.CHANGED:
+            _add_plan_audit_log(
+                db, plan, models.PlanAction.PLAN_FREEZE_HIT, req.operator_id,
+                item_id=item.id,
+                detail=f"重新预检条目 {item.date}: 命中{len(freeze_conflicts)}条冻结规则",
+            )
+        else:
+            _add_plan_audit_log(
+                db, plan, models.PlanAction.PLAN_RECHECK, req.operator_id,
+                item_id=item.id,
+                detail=f"重新预检条目 {item.date}: 仍命中{len(freeze_conflicts)}条冻结规则",
+            )
+        
+        if plan.status == models.PlanStatus.APPROVED:
+            plan.status = models.PlanStatus.CONFIRMING
+            plan.updated_at = datetime.utcnow()
+        
         db.commit()
         db.refresh(item)
         return item
     
     item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
-    item.current_diff_type = models.DiffType.NO_CHANGE
-    item.current_diff_detail = None
-    item.status = models.PlanItemStatus.APPROVED
+    
+    if old_status == models.PlanItemStatus.CHANGED:
+        all_active_hits = db.query(models.FreezeHitRecord).filter(
+            models.FreezeHitRecord.item_id == item.id,
+            models.FreezeHitRecord.plan_id == plan.id,
+            models.FreezeHitRecord.status == models.FreezeHitRecordStatus.ACTIVE,
+        ).all()
+        
+        if not freeze_conflicts:
+            item.status = models.PlanItemStatus.APPROVED
+            item.current_diff_type = models.DiffType.NO_CHANGE
+            item.current_diff_detail = None
+            
+            for hit in all_active_hits:
+                hit.status = models.FreezeHitRecordStatus.RECOVERED
+                hit.recovered_at = datetime.utcnow()
+                hit.recovered_by = req.operator_id
+                hit.recovery_reason = "人工重新预检后恢复"
+                hit.updated_at = datetime.utcnow()
+                
+                recovery_log = models.FreezeRecoveryLog(
+                    rule_id=hit.rule_id,
+                    rule_name=hit.rule_name,
+                    trigger_action="recheck",
+                    plan_id=plan.id,
+                    item_id=item.id,
+                    item_date=item.date,
+                    status_before="CHANGED",
+                    status_after="APPROVED",
+                    still_blocked_by_rule_ids=None,
+                    operator_id=req.operator_id,
+                    detail=f"人工重新预检: 条目{item.date}状态 CHANGED->APPROVED",
+                )
+                db.add(recovery_log)
+            
+            _add_plan_audit_log(
+                db, plan, models.PlanAction.PLAN_FREEZE_RECOVER, req.operator_id,
+                item_id=item.id,
+                detail=f"重新预检条目 {item.date}: 冻结冲突已恢复",
+            )
+        else:
+            item.current_diff_type = models.DiffType.CONFLICT_CHANGED
+            item.status = models.PlanItemStatus.CHANGED
+    else:
+        item.current_diff_type = models.DiffType.NO_CHANGE
+        item.current_diff_detail = None
+        item.status = models.PlanItemStatus.APPROVED
+    
     item.updated_at = datetime.utcnow()
     
     _add_plan_audit_log(
@@ -3089,6 +3150,12 @@ def create_freeze_rule(
                (f"，检测到{len(overlap_warnings)}条重叠规则" if overlap_warnings else ""),
     )
 
+    db.flush()
+
+    revalidation = revalidate_after_freeze_change(
+        db, db_rule, rule_in.creator_id, "create"
+    )
+
     db.commit()
     db.refresh(db_rule)
     return db_rule
@@ -3161,6 +3228,15 @@ def update_freeze_rule(
         exclude_rule_id=rule_id,
     )
 
+    has_time_change = (
+        "date_from" in update_data or
+        "date_to" in update_data or
+        "start_time" in update_data or
+        "end_time" in update_data or
+        "environment_id" in update_data or
+        "freeze_scope" in update_data
+    )
+
     for k, v in update_data.items():
         setattr(db_rule, k, v)
 
@@ -3171,6 +3247,10 @@ def update_freeze_rule(
         detail=f"更新冻结规则: {db_rule.name}" +
                (f"，检测到{len(overlap_warnings)}条重叠规则" if overlap_warnings else ""),
     )
+
+    if has_time_change and db_rule.status == models.FreezeRuleStatus.ACTIVE:
+        db.flush()
+        revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "update")
 
     db.commit()
     db.refresh(db_rule)
@@ -3184,12 +3264,18 @@ def delete_freeze_rule(db: Session, rule_id: int, operator_id: int) -> None:
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
 
-    _auto_recover_for_rule_change(db, db_rule, operator_id, "delete")
+    old_status = db_rule.status
+    db_rule.status = models.FreezeRuleStatus.INACTIVE
+    db_rule.updated_at = datetime.utcnow()
 
     _add_freeze_audit_log(
         db, db_rule, models.FreezeAction.FREEZE_DELETE, operator_id,
         detail=f"删除冻结规则: {db_rule.name}",
     )
+
+    db.flush()
+
+    revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "delete")
 
     db.delete(db_rule)
     db.commit()
@@ -3212,6 +3298,8 @@ def activate_freeze_rule(
         db, db_rule, models.FreezeAction.FREEZE_ACTIVATE, operator_id,
         detail=f"启用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
     )
+
+    db.flush()
 
     revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "activate")
 
@@ -3238,7 +3326,9 @@ def deactivate_freeze_rule(
         detail=f"停用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
     )
 
-    _auto_recover_for_rule_change(db, db_rule, operator_id, "deactivate")
+    db.flush()
+
+    revalidation = revalidate_after_freeze_change(db, db_rule, operator_id, "deactivate")
 
     db.commit()
     db.refresh(db_rule)
@@ -3255,6 +3345,9 @@ def revalidate_after_freeze_change(
         "rule_id": rule.id,
         "rule_name": rule.name,
         "action": action,
+        "hit_count": 0,
+        "recovered_count": 0,
+        "still_blocked_count": 0,
         "affected_plans": [],
         "affected_windows": [],
     }
@@ -3264,6 +3357,8 @@ def revalidate_after_freeze_change(
     plans = db.query(models.SchedulePlan).filter(
         models.SchedulePlan.environment_id == env_id,
         models.SchedulePlan.status.in_([
+            models.PlanStatus.DRAFT,
+            models.PlanStatus.PENDING_APPROVAL,
             models.PlanStatus.APPROVED,
             models.PlanStatus.CONFIRMING,
             models.PlanStatus.CONFIRMED,
@@ -3271,7 +3366,10 @@ def revalidate_after_freeze_change(
     ).all()
 
     for plan in plans:
-        affected_items = []
+        plan_affected_items = []
+        plan_has_new_hits = False
+        plan_has_recoveries = False
+
         for item in plan.items:
             if item.status in [models.PlanItemStatus.EXCLUDED, models.PlanItemStatus.CREATED]:
                 continue
@@ -3280,71 +3378,249 @@ def revalidate_after_freeze_change(
             start_dt = _combine_datetime(item_date, item.start_time)
             end_dt = _combine_datetime(item_date, item.end_time)
 
-            if action == "activate":
-                conflicts = check_freeze_conflicts(
-                    db, env_id, start_dt, end_dt,
-                    models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
-                )
-                scope_conflicts = [c for c in conflicts if c.id == rule.id]
-                if scope_conflicts:
-                    affected_items.append({
-                        "item_id": item.id,
-                        "date": item.date,
-                        "conflict": True,
-                    })
+            all_conflicts = check_freeze_conflicts(
+                db, env_id, start_dt, end_dt, models.FreezeRuleScope.ALL
+            )
 
-            elif action == "deactivate":
-                remaining_conflicts = check_freeze_conflicts(
-                    db, env_id, start_dt, end_dt,
-                    models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
-                )
-                if not remaining_conflicts:
-                    affected_items.append({
-                        "item_id": item.id,
-                        "date": item.date,
-                        "conflict": False,
-                        "can_proceed": True,
-                    })
+            is_hit_by_this_rule = any(c.id == rule.id for c in all_conflicts)
+            has_other_conflicts = len(all_conflicts) > 0 and not is_hit_by_this_rule
+            has_any_conflict = len(all_conflicts) > 0
 
-        if affected_items:
+            item_result = {
+                "item_id": item.id,
+                "date": item.date,
+                "status_before": item.status.value if item.status else None,
+            }
+
+            if has_any_conflict:
+                if item.status in [models.PlanItemStatus.APPROVED, models.PlanItemStatus.PENDING,
+                                  models.PlanItemStatus.CONFIRMED]:
+                    old_status = item.status
+                    item.status = models.PlanItemStatus.CHANGED
+                    item.current_diff_type = models.DiffType.FREEZE_CONFLICT
+
+                    diff_hints = []
+                    for c in all_conflicts:
+                        overlap_type = _classify_overlap_type(start_dt, end_dt, c)
+                        diff_hints.append({
+                            "diff_type": "FREEZE_CONFLICT",
+                            "detail": _build_freeze_conflict_reason(c, "ALL", start_dt, end_dt),
+                            "rule_id": c.id,
+                            "rule_name": c.name,
+                            "rule_reason": c.reason,
+                            "overlap_type": overlap_type,
+                        })
+                    item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False)
+                    item.updated_at = datetime.utcnow()
+
+                    for c in all_conflicts:
+                        overlap_type = _classify_overlap_type(start_dt, end_dt, c)
+                        hit_reason = _build_freeze_conflict_reason(c, "ALL", start_dt, end_dt)
+                        record_freeze_hit(
+                            db, c, plan.id, item, operator_id,
+                            hit_reason=hit_reason,
+                            overlap_type=overlap_type,
+                        )
+
+                    item_result["status_after"] = "CHANGED"
+                    item_result["hit_rules"] = [c.id for c in all_conflicts]
+                    item_result["action"] = "hit"
+                    plan_has_new_hits = True
+                    result["hit_count"] += 1
+
+                elif item.status == models.PlanItemStatus.CHANGED:
+                    existing_hits = db.query(models.FreezeHitRecord).filter(
+                        models.FreezeHitRecord.item_id == item.id,
+                        models.FreezeHitRecord.status == models.FreezeHitRecordStatus.ACTIVE,
+                    ).all()
+                    existing_rule_ids = {h.rule_id for h in existing_hits}
+                    current_rule_ids = {c.id for c in all_conflicts}
+                    
+                    new_hit_rules = [c for c in all_conflicts if c.id not in existing_rule_ids]
+                    removed_rules = [h for h in existing_hits if h.rule_id not in current_rule_ids]
+                    
+                    has_changes = False
+                    
+                    if new_hit_rules:
+                        for c in new_hit_rules:
+                            overlap_type = _classify_overlap_type(start_dt, end_dt, c)
+                            hit_reason = _build_freeze_conflict_reason(c, "ALL", start_dt, end_dt)
+                            record_freeze_hit(
+                                db, c, plan.id, item, operator_id,
+                                hit_reason=hit_reason,
+                                overlap_type=overlap_type,
+                            )
+                        has_changes = True
+                        plan_has_new_hits = True
+                        result["hit_count"] += 1
+                    
+                    if removed_rules:
+                        for hit in removed_rules:
+                            hit.status = models.FreezeHitRecordStatus.RECOVERED
+                            hit.recovered_at = datetime.utcnow()
+                            hit.recovered_by = operator_id
+                            hit.recovery_reason = f"规则{action}后自动恢复"
+                            hit.updated_at = datetime.utcnow()
+                            
+                            recovery_log = models.FreezeRecoveryLog(
+                                rule_id=hit.rule_id,
+                                rule_name=hit.rule_name,
+                                trigger_action=action,
+                                plan_id=plan.id,
+                                item_id=item.id,
+                                item_date=item.date,
+                                status_before="CHANGED",
+                                status_after="CHANGED",
+                                still_blocked_by_rule_ids=json.dumps(list(current_rule_ids)) if current_rule_ids else None,
+                                operator_id=operator_id,
+                                detail=f"规则{action}: {hit.rule_name}，条目{item.date}，仍被其他{len(current_rule_ids)}条规则拦截",
+                            )
+                            db.add(recovery_log)
+                        has_changes = True
+                        plan_has_recoveries = True
+                        result["recovered_count"] += len(removed_rules)
+                    
+                    if has_changes:
+                        diff_hints = []
+                        for c in all_conflicts:
+                            overlap_type = _classify_overlap_type(start_dt, end_dt, c)
+                            diff_hints.append({
+                                "diff_type": "FREEZE_CONFLICT",
+                                "detail": _build_freeze_conflict_reason(c, "ALL", start_dt, end_dt),
+                                "rule_id": c.id,
+                                "rule_name": c.name,
+                                "rule_reason": c.reason,
+                                "overlap_type": overlap_type,
+                            })
+                        item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False)
+                        item.updated_at = datetime.utcnow()
+                        
+                        item_result["status_after"] = "CHANGED"
+                        item_result["hit_rules"] = [c.id for c in all_conflicts]
+                        item_result["action"] = "hit_rules_changed"
+                    else:
+                        item_result["status_after"] = "CHANGED"
+                        item_result["action"] = "already_blocked"
+                        result["still_blocked_count"] += 1
+
+            else:
+                if item.status == models.PlanItemStatus.CHANGED:
+                    recovery = _recover_item_if_no_other_freeze(
+                        db, item, plan, -1, operator_id, action,
+                        rule.name, rule.id,
+                    )
+                    if recovery["recovered"]:
+                        item_result["status_after"] = recovery["status_after"]
+                        item_result["action"] = "recovered"
+                        plan_has_recoveries = True
+                        result["recovered_count"] += 1
+                    else:
+                        item_result["status_after"] = "CHANGED"
+                        item_result["action"] = "still_blocked"
+                        result["still_blocked_count"] += 1
+                else:
+                    active_hit = db.query(models.FreezeHitRecord).filter(
+                        models.FreezeHitRecord.rule_id == rule.id,
+                        models.FreezeHitRecord.item_id == item.id,
+                        models.FreezeHitRecord.status == models.FreezeHitRecordStatus.ACTIVE,
+                    ).first()
+                    if active_hit:
+                        active_hit.status = models.FreezeHitRecordStatus.RECOVERED
+                        active_hit.recovered_at = datetime.utcnow()
+                        active_hit.recovered_by = operator_id
+                        active_hit.recovery_reason = f"规则{action}后自动恢复"
+                        active_hit.updated_at = datetime.utcnow()
+
+                        recovery_log = models.FreezeRecoveryLog(
+                            rule_id=rule.id,
+                            rule_name=rule.name,
+                            trigger_action=action,
+                            plan_id=plan.id,
+                            item_id=item.id,
+                            item_date=item.date,
+                            status_before=item.status.value if item.status else None,
+                            status_after=item.status.value if item.status else None,
+                            still_blocked_by_rule_ids=None,
+                            operator_id=operator_id,
+                            detail=f"规则{action}: {rule.name}，条目{item.date}，命中记录已恢复",
+                        )
+                        db.add(recovery_log)
+
+                        item_result["status_after"] = item.status.value if item.status else None
+                        item_result["action"] = "hit_record_recovered"
+                        plan_has_recoveries = True
+                        result["recovered_count"] += 1
+                    else:
+                        item_result["status_after"] = item.status.value if item.status else None
+                        item_result["action"] = "no_change"
+
+            plan_affected_items.append(item_result)
+
+        if plan_has_new_hits or plan_has_recoveries:
+            if plan.status in [models.PlanStatus.APPROVED, models.PlanStatus.CONFIRMED] and plan_has_new_hits:
+                plan.status = models.PlanStatus.CONFIRMING
+                plan.updated_at = datetime.utcnow()
+
+            elif plan.status == models.PlanStatus.CONFIRMING and plan_has_recoveries:
+                has_any_changed = any(
+                    it.status == models.PlanItemStatus.CHANGED
+                    for it in plan.items
+                    if it.status not in [models.PlanItemStatus.EXCLUDED, models.PlanItemStatus.CREATED]
+                )
+                if not has_any_changed:
+                    plan.status = models.PlanStatus.APPROVED
+                    plan.updated_at = datetime.utcnow()
+
             result["affected_plans"].append({
                 "plan_id": plan.id,
                 "plan_name": plan.name,
-                "plan_status": plan.status.value,
-                "items": affected_items,
+                "plan_status_before": plan.status.value,
+                "plan_status_after": plan.status.value,
+                "has_new_hits": plan_has_new_hits,
+                "has_recoveries": plan_has_recoveries,
+                "items": plan_affected_items,
             })
 
-            if action == "deactivate":
-                for ai in affected_items:
-                    if ai.get("can_proceed"):
-                        plan_item = db.query(models.SchedulePlanItem).filter(
-                            models.SchedulePlanItem.id == ai["item_id"]
-                        ).first()
-                        if plan_item and plan_item.status == models.PlanItemStatus.CHANGED:
-                            plan_item.status = models.PlanItemStatus.APPROVED
-                            plan_item.current_diff_type = None
-                            plan_item.current_diff_detail = None
-                            plan_item.updated_at = datetime.utcnow()
+            _add_plan_audit_log(
+                db, plan,
+                models.PlanAction.PLAN_FREEZE_HIT if plan_has_new_hits else models.PlanAction.PLAN_FREEZE_RECOVER,
+                operator_id,
+                detail=f"冻结规则{action}后重校验: {rule.name}，"
+                       f"新命中{sum(1 for i in plan_affected_items if i.get('action') == 'hit')}条，"
+                       f"恢复{sum(1 for i in plan_affected_items if i.get('action') == 'recovered')}条",
+            )
 
     windows = db.query(models.MaintenanceWindow).filter(
         models.MaintenanceWindow.environment_id == env_id,
-        models.MaintenanceWindow.status.in_([
-            WindowStatus.DRAFT,
-        ]),
     ).all()
 
     for win in windows:
-        if action == "deactivate":
-            remaining = check_freeze_conflicts(
-                db, env_id, win.start_time, win.end_time,
-                models.FreezeRuleScope.ALL, exclude_rule_id=rule.id,
-            )
-            if not remaining:
-                result["affected_windows"].append({
-                    "window_id": win.id,
-                    "title": win.title,
-                    "can_proceed": True,
-                })
+        all_conflicts = check_freeze_conflicts(
+            db, env_id, win.start_time, win.end_time, models.FreezeRuleScope.ALL
+        )
+        has_any_conflict = len(all_conflicts) > 0
+        is_hit_by_this_rule = any(c.id == rule.id for c in all_conflicts)
+
+        if is_hit_by_this_rule:
+            result["affected_windows"].append({
+                "window_id": win.id,
+                "title": win.title,
+                "status": win.status.value if win.status else None,
+                "has_conflict": has_any_conflict,
+                "hit_by_this_rule": True,
+            })
+            for c in all_conflicts:
+                _add_freeze_audit_log(
+                    db, c, models.FreezeAction.FREEZE_HIT_WINDOW, operator_id,
+                    detail=_build_freeze_conflict_reason(c, "ALL", win.start_time, win.end_time),
+                    target_window_id=win.id,
+                )
+
+    _add_freeze_audit_log(
+        db, rule, models.FreezeAction.FREEZE_RECOVER, operator_id,
+        detail=f"规则{action}后自动重校验: 新命中{result['hit_count']}条，"
+               f"恢复{result['recovered_count']}条，仍拦截{result['still_blocked_count']}条",
+    )
 
     return result
 
