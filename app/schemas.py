@@ -743,3 +743,147 @@ class PlanImportResult(BaseModel):
     skipped: int
     failed: int
     details: List[dict]
+
+
+# ============== Freeze Calendar Schemas ==============
+
+class FreezeRuleBase(BaseModel):
+    name: str = Field(..., max_length=200)
+    description: Optional[str] = None
+    environment_id: int
+    freeze_scope: str = Field("ALL", pattern=r"^(CREATE|SUBMIT|APPROVE|ALL)$")
+    date_from: datetime
+    date_to: datetime
+    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class FreezeRuleCreate(FreezeRuleBase):
+    creator_id: int
+
+
+class FreezeRuleUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = None
+    environment_id: Optional[int] = None
+    freeze_scope: Optional[str] = Field(None, pattern=r"^(CREATE|SUBMIT|APPROVE|ALL)$")
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class FreezeRule(FreezeRuleBase):
+    id: int
+    status: str
+    creator_id: int
+    created_at: datetime
+    updated_at: datetime
+    environment: Optional[Environment] = None
+    creator: Optional[User] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeRuleDetail(FreezeRule):
+    audit_logs: List[dict] = []
+
+
+class FreezeAuditLogBase(BaseModel):
+    rule_id: int
+    action: str
+    operator_id: int
+    detail: Optional[str] = None
+
+
+class FreezeAuditLog(FreezeAuditLogBase):
+    id: int
+    snapshot: Optional[dict] = None
+    target_window_id: Optional[int] = None
+    target_plan_id: Optional[int] = None
+    target_item_id: Optional[int] = None
+    created_at: datetime
+    operator: Optional[User] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeCheckItem(BaseModel):
+    date: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    start_datetime: Optional[datetime] = None
+    end_datetime: Optional[datetime] = None
+
+
+class FreezeConflictItem(BaseModel):
+    rule_id: int
+    rule_name: str
+    freeze_scope: str
+    reason: Optional[str] = None
+    date_from: datetime
+    date_to: datetime
+    conflict_reason: str
+
+
+class FreezeCheckResult(BaseModel):
+    has_conflict: bool
+    conflicts: List[FreezeConflictItem] = []
+
+
+class FreezeRuleToggleRequest(BaseModel):
+    operator_id: int
+
+
+class FreezeExportItem(BaseModel):
+    name: str
+    description: Optional[str] = None
+    environment_name: str
+    freeze_scope: str
+    date_from: str
+    date_to: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    remark: Optional[str] = None
+    creator_username: Optional[str] = None
+    created_at: Optional[str] = None
+    audit_logs: List[dict] = []
+
+
+class FreezeImportItem(BaseModel):
+    name: str
+    description: Optional[str] = None
+    environment_name: str
+    freeze_scope: str
+    date_from: str
+    date_to: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    remark: Optional[str] = None
+    creator_username: Optional[str] = None
+    created_at: Optional[str] = None
+    audit_logs: Optional[List[dict]] = None
+
+
+class FreezeImportRequest(BaseModel):
+    rules: List[FreezeImportItem]
+    operator_id: int
+    on_conflict: str = Field("skip", pattern=r"^(skip|overwrite|error)$")
+
+
+class FreezeImportResult(BaseModel):
+    total: int
+    success: int
+    skipped: int
+    failed: int
+    details: List[dict]

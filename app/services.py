@@ -251,6 +251,11 @@ def create_maintenance_window(
     if not creator:
         raise BusinessError(f"创建人 ID={win_in.creator_id} 不存在", 404)
 
+    check_window_freeze_and_raise(
+        db, win_in.environment_id, win_in.start_time, win_in.end_time,
+        models.FreezeRuleScope.CREATE, win_in.creator_id,
+    )
+
     db_win = models.MaintenanceWindow(**win_in.model_dump(), status=WindowStatus.DRAFT)
     db.add(db_win)
     db.flush()
@@ -328,6 +333,11 @@ def submit_window(db: Session, win_id: int, req: schemas.SubmitRequest) -> model
 
     _validate_time_range(db_win.start_time, db_win.end_time)
 
+    check_window_freeze_and_raise(
+        db, db_win.environment_id, db_win.start_time, db_win.end_time,
+        models.FreezeRuleScope.SUBMIT, req.operator_id, window_id=db_win.id,
+    )
+
     old_status = db_win.status
     db_win.status = WindowStatus.SUBMITTED
     db_win.updated_at = datetime.utcnow()
@@ -357,6 +367,11 @@ def approve_window(db: Session, win_id: int, req: schemas.ApproveRequest) -> mod
         raise BusinessError(f"审批人 ID={req.operator_id} 不存在", 404)
 
     _validate_time_range(db_win.start_time, db_win.end_time)
+
+    check_window_freeze_and_raise(
+        db, db_win.environment_id, db_win.start_time, db_win.end_time,
+        models.FreezeRuleScope.APPROVE, req.operator_id, window_id=db_win.id,
+    )
 
     overlaps = check_time_overlap(db, db_win.environment_id, db_win.start_time, db_win.end_time, exclude_window_id=win_id)
     if overlaps:
@@ -1623,6 +1638,18 @@ def submit_schedule_plan(
     if plan.total_count == 0:
         raise BusinessError("方案中没有候选窗口，无法提交审批")
     
+    freeze_conflicts = check_plan_freeze_for_items(
+        db, plan_id, plan.environment_id, plan.items,
+        models.FreezeRuleScope.SUBMIT, req.operator_id
+    )
+    if freeze_conflicts:
+        conflict_names = list(set([c["rule_name"] for c in freeze_conflicts]))
+        raise BusinessError(
+            f"提交被冻结规则拦截，涉及 {len(freeze_conflicts)} 条窗口，"
+            f"冻结规则: {', '.join(conflict_names)}",
+            403,
+        )
+    
     old_status = plan.status
     plan.status = models.PlanStatus.PENDING_APPROVAL
     plan.updated_at = datetime.utcnow()
@@ -1648,6 +1675,18 @@ def approve_schedule_plan(
     
     if plan.status != models.PlanStatus.PENDING_APPROVAL:
         raise BusinessError(f"当前状态 {plan.status.value} 不能审批")
+    
+    freeze_conflicts = check_plan_freeze_for_items(
+        db, plan_id, plan.environment_id, plan.items,
+        models.FreezeRuleScope.APPROVE, req.operator_id
+    )
+    if freeze_conflicts:
+        conflict_names = list(set([c["rule_name"] for c in freeze_conflicts]))
+        raise BusinessError(
+            f"审批被冻结规则拦截，涉及 {len(freeze_conflicts)} 条窗口，"
+            f"冻结规则: {', '.join(conflict_names)}",
+            403,
+        )
     
     old_status = plan.status
     plan.status = models.PlanStatus.APPROVED
@@ -1876,6 +1915,22 @@ def detect_plan_changes(
             message=new_message,
         )
         
+        freeze_conflicts = check_freeze_conflicts(
+            db, plan.environment_id, start_dt, end_dt, models.FreezeRuleScope.ALL
+        )
+        
+        if freeze_conflicts:
+            freeze_rule = freeze_conflicts[0]
+            freeze_reason = _build_freeze_conflict_reason(freeze_rule, "ALL")
+            current_diff_type = models.DiffType.CONFLICT_CHANGED
+            diff_hints.append({
+                "diff_type": "FREEZE_CONFLICT",
+                "detail": freeze_reason,
+                "rule_id": freeze_rule.id,
+                "rule_name": freeze_rule.name,
+                "rule_reason": freeze_rule.reason,
+            })
+        
         item.current_diff_type = current_diff_type
         item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False) if diff_hints else None
         item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
@@ -1973,6 +2028,36 @@ def recheck_plan_item(
         conflict_window_status=new_conflict_window_status,
         message=new_message,
     )
+    
+    freeze_conflicts = check_freeze_conflicts(
+        db, plan.environment_id, start_dt, end_dt, models.FreezeRuleScope.ALL
+    )
+    
+    if freeze_conflicts:
+        freeze_rule = freeze_conflicts[0]
+        freeze_reason = _build_freeze_conflict_reason(freeze_rule, "ALL")
+        diff_hints = [{
+            "diff_type": "FREEZE_CONFLICT",
+            "detail": freeze_reason,
+            "rule_id": freeze_rule.id,
+            "rule_name": freeze_rule.name,
+            "rule_reason": freeze_rule.reason,
+        }]
+        item.current_diff_type = models.DiffType.CONFLICT_CHANGED
+        item.current_diff_detail = json.dumps(diff_hints, ensure_ascii=False)
+        item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
+        item.status = models.PlanItemStatus.CHANGED
+        item.updated_at = datetime.utcnow()
+        
+        _add_plan_audit_log(
+            db, plan, models.PlanAction.PLAN_RECHECK, req.operator_id,
+            item_id=item.id,
+            detail=f"重新预检条目 {item.date}: 命中冻结规则 {freeze_rule.name}",
+        )
+        
+        db.commit()
+        db.refresh(item)
+        return item
     
     item.latest_precheck = json.dumps(latest_precheck.model_dump(), ensure_ascii=False)
     item.current_diff_type = models.DiffType.NO_CHANGE
@@ -2604,6 +2689,664 @@ def import_schedule_plans(
     db.commit()
     
     return schemas.PlanImportResult(
+        total=total,
+        success=success,
+        skipped=skipped,
+        failed=failed,
+        details=details,
+    )
+
+
+# ============== Freeze Calendar Service ==============
+
+def _freeze_rule_snapshot(rule: models.FreezeRule) -> str:
+    return json.dumps({
+        "id": rule.id,
+        "name": rule.name,
+        "description": rule.description,
+        "environment_id": rule.environment_id,
+        "freeze_scope": rule.freeze_scope.value if rule.freeze_scope else None,
+        "date_from": rule.date_from.isoformat() if rule.date_from else None,
+        "date_to": rule.date_to.isoformat() if rule.date_to else None,
+        "start_time": rule.start_time,
+        "end_time": rule.end_time,
+        "reason": rule.reason,
+        "status": rule.status.value if rule.status else None,
+        "remark": rule.remark,
+        "creator_id": rule.creator_id,
+    }, ensure_ascii=False)
+
+
+def _add_freeze_audit_log(
+    db: Session,
+    rule: models.FreezeRule,
+    action: models.FreezeAction,
+    operator_id: int,
+    detail: Optional[str] = None,
+    target_window_id: Optional[int] = None,
+    target_plan_id: Optional[int] = None,
+    target_item_id: Optional[int] = None,
+):
+    log = models.FreezeAuditLog(
+        rule_id=rule.id,
+        action=action,
+        operator_id=operator_id,
+        detail=detail,
+        snapshot=_freeze_rule_snapshot(rule),
+        target_window_id=target_window_id,
+        target_plan_id=target_plan_id,
+        target_item_id=target_item_id,
+    )
+    db.add(log)
+
+
+def _check_freeze_manage_permission(db: Session, operator_id: int) -> bool:
+    if not user_can_approve(db, operator_id):
+        raise BusinessError("只有审批角色可以管理冻结规则", 403)
+    return True
+
+
+def _combine_datetime_from_str(d: date, time_str: Optional[str]) -> Optional[datetime]:
+    if not time_str:
+        return None
+    try:
+        h, m = map(int, time_str.split(":"))
+        return datetime(d.year, d.month, d.day, h, m)
+    except ValueError:
+        return None
+
+
+def _time_in_range(check_time: datetime, start_str: Optional[str], end_str: Optional[str]) -> bool:
+    if not start_str or not end_str:
+        return True
+    try:
+        sh, sm = map(int, start_str.split(":"))
+        eh, em = map(int, end_str.split(":"))
+        check_minutes = check_time.hour * 60 + check_time.minute
+        start_minutes = sh * 60 + sm
+        end_minutes = eh * 60 + em
+        if end_minutes > start_minutes:
+            return start_minutes <= check_minutes < end_minutes
+        else:
+            return check_minutes >= start_minutes or check_minutes < end_minutes
+    except ValueError:
+        return True
+
+
+def check_freeze_conflicts(
+    db: Session,
+    environment_id: int,
+    start_time: datetime,
+    end_time: datetime,
+    scope: models.FreezeRuleScope = models.FreezeRuleScope.ALL,
+    exclude_rule_id: Optional[int] = None,
+) -> List[models.FreezeRule]:
+    q = db.query(models.FreezeRule).filter(
+        models.FreezeRule.environment_id == environment_id,
+        models.FreezeRule.status == models.FreezeRuleStatus.ACTIVE,
+        models.FreezeRule.date_from < end_time,
+        models.FreezeRule.date_to > start_time,
+    )
+    if exclude_rule_id is not None:
+        q = q.filter(models.FreezeRule.id != exclude_rule_id)
+    
+    all_rules = q.all()
+    matching_rules = []
+    
+    for rule in all_rules:
+        rule_scope = rule.freeze_scope
+        if rule_scope != models.FreezeRuleScope.ALL and rule_scope != scope:
+            continue
+        
+        if rule.start_time and rule.end_time:
+            has_overlap = False
+            current = start_time
+            while current < end_time:
+                if _time_in_range(current, rule.start_time, rule.end_time):
+                    has_overlap = True
+                    break
+                current += timedelta(minutes=30)
+                if current > end_time:
+                    current = end_time
+            if not has_overlap:
+                continue
+        
+        matching_rules.append(rule)
+    
+    return matching_rules
+
+
+def check_freeze_for_date(
+    db: Session,
+    environment_id: int,
+    check_date: date,
+    start_time_str: Optional[str] = None,
+    end_time_str: Optional[str] = None,
+    scope: models.FreezeRuleScope = models.FreezeRuleScope.ALL,
+) -> List[models.FreezeRule]:
+    start_dt = datetime(check_date.year, check_date.month, check_date.day, 0, 0)
+    end_dt = datetime(check_date.year, check_date.month, check_date.day, 23, 59, 59)
+    
+    if start_time_str:
+        try:
+            h, m = map(int, start_time_str.split(":"))
+            start_dt = datetime(check_date.year, check_date.month, check_date.day, h, m)
+        except ValueError:
+            pass
+    
+    if end_time_str:
+        try:
+            h, m = map(int, end_time_str.split(":"))
+            end_dt = datetime(check_date.year, check_date.month, check_date.day, h, m)
+        except ValueError:
+            pass
+    
+    return check_freeze_conflicts(db, environment_id, start_dt, end_dt, scope)
+
+
+def create_freeze_rule(
+    db: Session, rule_in: schemas.FreezeRuleCreate
+) -> models.FreezeRule:
+    _check_freeze_manage_permission(db, rule_in.creator_id)
+    
+    env = get_environment(db, rule_in.environment_id)
+    if not env:
+        raise BusinessError(f"环境 ID={rule_in.environment_id} 不存在", 404)
+    
+    creator = get_user(db, rule_in.creator_id)
+    if not creator:
+        raise BusinessError(f"创建人 ID={rule_in.creator_id} 不存在", 404)
+    
+    if rule_in.date_to <= rule_in.date_from:
+        raise BusinessError("冻结结束时间必须晚于开始时间")
+    
+    if rule_in.start_time and rule_in.end_time:
+        try:
+            sh, sm = map(int, rule_in.start_time.split(":"))
+            eh, em = map(int, rule_in.end_time.split(":"))
+        except ValueError:
+            raise BusinessError("时间格式不正确，应为 HH:MM")
+    
+    existing = db.query(models.FreezeRule).filter(
+        models.FreezeRule.name == rule_in.name,
+        models.FreezeRule.environment_id == rule_in.environment_id,
+    ).first()
+    if existing:
+        raise BusinessError(f"同一环境下冻结规则名称 '{rule_in.name}' 已存在")
+    
+    scope_map = {s.value: s for s in models.FreezeRuleScope}
+    freeze_scope = scope_map.get(rule_in.freeze_scope, models.FreezeRuleScope.ALL)
+    
+    db_rule = models.FreezeRule(
+        name=rule_in.name,
+        description=rule_in.description,
+        environment_id=rule_in.environment_id,
+        freeze_scope=freeze_scope,
+        date_from=rule_in.date_from,
+        date_to=rule_in.date_to,
+        start_time=rule_in.start_time,
+        end_time=rule_in.end_time,
+        reason=rule_in.reason,
+        status=models.FreezeRuleStatus.ACTIVE,
+        remark=rule_in.remark,
+        creator_id=rule_in.creator_id,
+    )
+    db.add(db_rule)
+    db.flush()
+    
+    _add_freeze_audit_log(
+        db, db_rule, models.FreezeAction.FREEZE_CREATE, rule_in.creator_id,
+        detail=f"创建冻结规则: {rule_in.name}",
+    )
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def get_freeze_rule(db: Session, rule_id: int) -> Optional[models.FreezeRule]:
+    return db.query(models.FreezeRule).filter(models.FreezeRule.id == rule_id).first()
+
+
+def list_freeze_rules(
+    db: Session,
+    environment_id: Optional[int] = None,
+    status: Optional[models.FreezeRuleStatus] = None,
+    active_only: bool = False,
+) -> List[models.FreezeRule]:
+    q = db.query(models.FreezeRule)
+    if environment_id is not None:
+        q = q.filter(models.FreezeRule.environment_id == environment_id)
+    if status is not None:
+        q = q.filter(models.FreezeRule.status == status)
+    if active_only:
+        q = q.filter(models.FreezeRule.status == models.FreezeRuleStatus.ACTIVE)
+    return q.order_by(models.FreezeRule.created_at.desc()).all()
+
+
+def update_freeze_rule(
+    db: Session, rule_id: int, rule_in: schemas.FreezeRuleUpdate, operator_id: int
+) -> models.FreezeRule:
+    _check_freeze_manage_permission(db, operator_id)
+    
+    db_rule = get_freeze_rule(db, rule_id)
+    if not db_rule:
+        raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+    
+    update_data = rule_in.model_dump(exclude_unset=True)
+    
+    if "name" in update_data:
+        existing = db.query(models.FreezeRule).filter(
+            models.FreezeRule.name == update_data["name"],
+            models.FreezeRule.environment_id == db_rule.environment_id,
+            models.FreezeRule.id != rule_id,
+        ).first()
+        if existing:
+            raise BusinessError(f"同一环境下冻结规则名称 '{update_data['name']}' 已存在")
+    
+    if "environment_id" in update_data:
+        env = get_environment(db, update_data["environment_id"])
+        if not env:
+            raise BusinessError(f"环境 ID={update_data['environment_id']} 不存在", 404)
+    
+    new_date_from = update_data.get("date_from", db_rule.date_from)
+    new_date_to = update_data.get("date_to", db_rule.date_to)
+    if new_date_to <= new_date_from:
+        raise BusinessError("冻结结束时间必须晚于开始时间")
+    
+    if "freeze_scope" in update_data:
+        scope_map = {s.value: s for s in models.FreezeRuleScope}
+        update_data["freeze_scope"] = scope_map.get(
+            update_data["freeze_scope"], models.FreezeRuleScope.ALL
+        )
+    
+    for k, v in update_data.items():
+        setattr(db_rule, k, v)
+    
+    db_rule.updated_at = datetime.utcnow()
+    
+    _add_freeze_audit_log(
+        db, db_rule, models.FreezeAction.FREEZE_UPDATE, operator_id,
+        detail=f"更新冻结规则: {db_rule.name}",
+    )
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def delete_freeze_rule(db: Session, rule_id: int, operator_id: int) -> None:
+    _check_freeze_manage_permission(db, operator_id)
+    
+    db_rule = get_freeze_rule(db, rule_id)
+    if not db_rule:
+        raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+    
+    db.delete(db_rule)
+    db.commit()
+
+
+def activate_freeze_rule(
+    db: Session, rule_id: int, operator_id: int
+) -> models.FreezeRule:
+    _check_freeze_manage_permission(db, operator_id)
+    
+    db_rule = get_freeze_rule(db, rule_id)
+    if not db_rule:
+        raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+    
+    old_status = db_rule.status
+    db_rule.status = models.FreezeRuleStatus.ACTIVE
+    db_rule.updated_at = datetime.utcnow()
+    
+    _add_freeze_audit_log(
+        db, db_rule, models.FreezeAction.FREEZE_ACTIVATE, operator_id,
+        detail=f"启用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
+    )
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def deactivate_freeze_rule(
+    db: Session, rule_id: int, operator_id: int
+) -> models.FreezeRule:
+    _check_freeze_manage_permission(db, operator_id)
+    
+    db_rule = get_freeze_rule(db, rule_id)
+    if not db_rule:
+        raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+    
+    old_status = db_rule.status
+    db_rule.status = models.FreezeRuleStatus.INACTIVE
+    db_rule.updated_at = datetime.utcnow()
+    
+    _add_freeze_audit_log(
+        db, db_rule, models.FreezeAction.FREEZE_DEACTIVATE, operator_id,
+        detail=f"停用冻结规则: {db_rule.name}，原状态={old_status.value if old_status else '未知'}",
+    )
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def get_freeze_audit_logs(
+    db: Session, rule_id: int
+) -> List[models.FreezeAuditLog]:
+    return db.query(models.FreezeAuditLog).filter(
+        models.FreezeAuditLog.rule_id == rule_id
+    ).order_by(models.FreezeAuditLog.created_at.desc()).all()
+
+
+def _build_freeze_conflict_reason(rule: models.FreezeRule, scope: str) -> str:
+    reason_parts = []
+    reason_parts.append(f"冻结规则「{rule.name}」")
+    if rule.reason:
+        reason_parts.append(f"（{rule.reason}）")
+    reason_parts.append(f"禁止{scope}操作")
+    if rule.start_time and rule.end_time:
+        reason_parts.append(f"，每日 {rule.start_time}-{rule.end_time}")
+    return "".join(reason_parts)
+
+
+def check_window_freeze_and_raise(
+    db: Session,
+    environment_id: int,
+    start_time: datetime,
+    end_time: datetime,
+    scope: models.FreezeRuleScope,
+    operator_id: int,
+    window_id: Optional[int] = None,
+) -> None:
+    conflicts = check_freeze_conflicts(db, environment_id, start_time, end_time, scope)
+    if not conflicts:
+        return
+    
+    for rule in conflicts:
+        _add_freeze_audit_log(
+            db, rule, models.FreezeAction.FREEZE_HIT_WINDOW, operator_id,
+            detail=_build_freeze_conflict_reason(rule, scope.value),
+            target_window_id=window_id,
+        )
+    
+    db.commit()
+    
+    conflict_descs = []
+    for rule in conflicts:
+        desc = f"[{rule.name}] {rule.reason or '冻结期'}"
+        conflict_descs.append(desc)
+    
+    raise BusinessError(
+        f"操作被冻结规则拦截: {'; '.join(conflict_descs)}",
+        403,
+    )
+
+
+def check_plan_freeze_for_items(
+    db: Session,
+    plan_id: int,
+    environment_id: int,
+    items: List,
+    scope: models.FreezeRuleScope,
+    operator_id: int,
+) -> List[dict]:
+    conflicts_info = []
+    
+    for item in items:
+        if item.status == models.PlanItemStatus.EXCLUDED:
+            continue
+        item_date = date.fromisoformat(item.date)
+        start_dt = _combine_datetime(item_date, item.start_time)
+        end_dt = _combine_datetime(item_date, item.end_time)
+        
+        conflicts = check_freeze_conflicts(db, environment_id, start_dt, end_dt, scope)
+        
+        for rule in conflicts:
+            _add_freeze_audit_log(
+                db, rule, models.FreezeAction.FREEZE_HIT_PLAN, operator_id,
+                detail=_build_freeze_conflict_reason(rule, scope.value),
+                target_plan_id=plan_id,
+                target_item_id=item.id,
+            )
+            conflicts_info.append({
+                "item_id": item.id,
+                "date": item.date,
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "freeze_scope": rule.freeze_scope.value if rule.freeze_scope else None,
+                "reason": rule.reason,
+                "conflict_reason": _build_freeze_conflict_reason(rule, scope.value),
+            })
+    
+    if conflicts_info:
+        db.commit()
+    
+    return conflicts_info
+
+
+# ============== Freeze Rule Import/Export ==============
+
+def export_freeze_rules(
+    db: Session,
+    rule_ids: Optional[List[int]] = None,
+    environment_id: Optional[int] = None,
+) -> List[dict]:
+    q = db.query(models.FreezeRule)
+    if rule_ids:
+        q = q.filter(models.FreezeRule.id.in_(rule_ids))
+    if environment_id is not None:
+        q = q.filter(models.FreezeRule.environment_id == environment_id)
+    
+    rules = q.all()
+    result = []
+    
+    for rule in rules:
+        env = rule.environment
+        creator = rule.creator
+        
+        audit_logs_data = []
+        for log in rule.audit_logs:
+            operator = log.operator
+            audit_logs_data.append({
+                "action": log.action.value if log.action else None,
+                "operator_username": operator.username if operator else None,
+                "operator_name": operator.display_name if operator else None,
+                "detail": log.detail,
+                "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+                "target_window_id": log.target_window_id,
+                "target_plan_id": log.target_plan_id,
+                "target_item_id": log.target_item_id,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            })
+        
+        result.append({
+            "name": rule.name,
+            "description": rule.description,
+            "environment_name": env.name if env else None,
+            "freeze_scope": rule.freeze_scope.value if rule.freeze_scope else "ALL",
+            "date_from": rule.date_from.isoformat() if rule.date_from else None,
+            "date_to": rule.date_to.isoformat() if rule.date_to else None,
+            "start_time": rule.start_time,
+            "end_time": rule.end_time,
+            "reason": rule.reason,
+            "status": rule.status.value if rule.status else "ACTIVE",
+            "remark": rule.remark,
+            "creator_username": creator.username if creator else None,
+            "created_at": rule.created_at.isoformat() if rule.created_at else None,
+            "audit_logs": audit_logs_data,
+        })
+    
+    return result
+
+
+def import_freeze_rules(
+    db: Session, req: schemas.FreezeImportRequest
+) -> schemas.FreezeImportResult:
+    _check_freeze_manage_permission(db, req.operator_id)
+    
+    operator = get_user(db, req.operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
+    
+    total = len(req.rules)
+    success = 0
+    skipped = 0
+    failed = 0
+    details = []
+    
+    for idx, item in enumerate(req.rules):
+        try:
+            env = get_environment_by_name(db, item.environment_name)
+            if not env:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "name": item.name,
+                    "status": "failed",
+                    "reason": f"环境 '{item.environment_name}' 不存在",
+                })
+                continue
+            
+            existing = db.query(models.FreezeRule).filter(
+                models.FreezeRule.name == item.name,
+                models.FreezeRule.environment_id == env.id,
+            ).first()
+            
+            if existing:
+                if req.on_conflict == "skip":
+                    skipped += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "skipped",
+                        "reason": "同名冻结规则已存在，跳过",
+                    })
+                    continue
+                elif req.on_conflict == "overwrite":
+                    db.delete(existing)
+                    db.flush()
+                else:
+                    failed += 1
+                    details.append({
+                        "index": idx,
+                        "name": item.name,
+                        "status": "failed",
+                        "reason": "同名冻结规则已存在",
+                    })
+                    continue
+            
+            scope_map = {s.value: s for s in models.FreezeRuleScope}
+            freeze_scope = scope_map.get(item.freeze_scope, models.FreezeRuleScope.ALL)
+            
+            status_map = {s.value: s for s in models.FreezeRuleStatus}
+            rule_status = status_map.get(item.status, models.FreezeRuleStatus.ACTIVE)
+            
+            date_from = None
+            date_to = None
+            if item.date_from:
+                date_from = datetime.fromisoformat(item.date_from)
+            if item.date_to:
+                date_to = datetime.fromisoformat(item.date_to)
+            
+            resolved_creator_id = req.operator_id
+            if item.creator_username:
+                creator_user = db.query(models.User).filter(
+                    models.User.username == item.creator_username
+                ).first()
+                if creator_user:
+                    resolved_creator_id = creator_user.id
+            
+            db_rule = models.FreezeRule(
+                name=item.name,
+                description=item.description,
+                environment_id=env.id,
+                freeze_scope=freeze_scope,
+                date_from=date_from,
+                date_to=date_to,
+                start_time=item.start_time,
+                end_time=item.end_time,
+                reason=item.reason,
+                status=rule_status,
+                remark=item.remark,
+                creator_id=resolved_creator_id,
+            )
+            if item.created_at:
+                db_rule.created_at = datetime.fromisoformat(item.created_at)
+            db.add(db_rule)
+            db.flush()
+            
+            if item.audit_logs:
+                for log_data in item.audit_logs:
+                    log_dict = log_data if isinstance(log_data, dict) else log_data
+                    if not log_dict:
+                        continue
+                    
+                    action_map = {a.value: a for a in models.FreezeAction}
+                    log_action = action_map.get(log_dict.get("action"), models.FreezeAction.FREEZE_IMPORT)
+                    
+                    op_username = log_dict.get("operator_username")
+                    resolved_op_id = req.operator_id
+                    if op_username:
+                        op_user = db.query(models.User).filter(
+                            models.User.username == op_username
+                        ).first()
+                        if op_user:
+                            resolved_op_id = op_user.id
+                    
+                    snapshot_val = None
+                    if log_dict.get("snapshot"):
+                        snapshot_val = json.dumps(log_dict["snapshot"], ensure_ascii=False)
+                    
+                    audit_log = models.FreezeAuditLog(
+                        rule_id=db_rule.id,
+                        action=log_action,
+                        operator_id=resolved_op_id,
+                        detail=log_dict.get("detail"),
+                        snapshot=snapshot_val,
+                        target_window_id=log_dict.get("target_window_id"),
+                        target_plan_id=log_dict.get("target_plan_id"),
+                        target_item_id=log_dict.get("target_item_id"),
+                    )
+                    if log_dict.get("created_at"):
+                        audit_log.created_at = datetime.fromisoformat(log_dict["created_at"])
+                    db.add(audit_log)
+            
+            _add_freeze_audit_log(
+                db, db_rule, models.FreezeAction.FREEZE_IMPORT, req.operator_id,
+                detail=f"导入冻结规则: {item.name}，状态={rule_status.value}",
+            )
+            
+            success += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "created",
+                "id": db_rule.id,
+                "audit_logs_restored": len(item.audit_logs) if item.audit_logs else 0,
+            })
+            
+        except BusinessError as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": e.message,
+            })
+        except Exception as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "name": item.name,
+                "status": "failed",
+                "reason": str(e),
+            })
+    
+    db.commit()
+    
+    return schemas.FreezeImportResult(
         total=total,
         success=success,
         skipped=skipped,

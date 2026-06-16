@@ -605,6 +605,203 @@ def import_schedule_plans(req: schemas.PlanImportRequest, db: Session = Depends(
     return services.import_schedule_plans(db, req)
 
 
+# ========== Freeze Calendar ==========
+
+@app.post("/freeze-rules", response_model=schemas.FreezeRule, tags=["冻结日历"])
+def create_freeze_rule(rule_in: schemas.FreezeRuleCreate, db: Session = Depends(get_db)):
+    return services.create_freeze_rule(db, rule_in)
+
+
+@app.get("/freeze-rules", response_model=List[schemas.FreezeRule], tags=["冻结日历"])
+def list_freeze_rules(
+    environment_id: Optional[int] = Query(None, description="环境ID筛选"),
+    status: Optional[str] = Query(None, description="状态筛选 (ACTIVE/INACTIVE)"),
+    active_only: bool = Query(False, description="只看生效中"),
+    db: Session = Depends(get_db),
+):
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.FreezeRuleStatus(status)
+        except ValueError:
+            pass
+    return services.list_freeze_rules(db, environment_id, status_enum, active_only)
+
+
+@app.get("/freeze-rules/{rule_id}", response_model=schemas.FreezeRuleDetail, tags=["冻结日历"])
+def get_freeze_rule(rule_id: int, db: Session = Depends(get_db)):
+    rule = services.get_freeze_rule(db, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="冻结规则不存在")
+    
+    audit_logs = []
+    for log in rule.audit_logs:
+        operator = log.operator
+        audit_logs.append({
+            "id": log.id,
+            "action": log.action.value if log.action else None,
+            "operator_id": log.operator_id,
+            "operator_username": operator.username if operator else None,
+            "operator_name": operator.display_name if operator else None,
+            "detail": log.detail,
+            "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+            "target_window_id": log.target_window_id,
+            "target_plan_id": log.target_plan_id,
+            "target_item_id": log.target_item_id,
+            "created_at": log.created_at,
+        })
+    
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "description": rule.description,
+        "environment_id": rule.environment_id,
+        "freeze_scope": rule.freeze_scope.value if rule.freeze_scope else "ALL",
+        "date_from": rule.date_from,
+        "date_to": rule.date_to,
+        "start_time": rule.start_time,
+        "end_time": rule.end_time,
+        "reason": rule.reason,
+        "status": rule.status.value if rule.status else "ACTIVE",
+        "remark": rule.remark,
+        "creator_id": rule.creator_id,
+        "created_at": rule.created_at,
+        "updated_at": rule.updated_at,
+        "environment": rule.environment,
+        "creator": rule.creator,
+        "audit_logs": audit_logs,
+    }
+
+
+@app.put("/freeze-rules/{rule_id}", response_model=schemas.FreezeRule, tags=["冻结日历"])
+def update_freeze_rule(
+    rule_id: int,
+    rule_in: schemas.FreezeRuleUpdate,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.update_freeze_rule(db, rule_id, rule_in, operator_id)
+
+
+@app.delete("/freeze-rules/{rule_id}", tags=["冻结日历"])
+def delete_freeze_rule(
+    rule_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    services.delete_freeze_rule(db, rule_id, operator_id)
+    return {"detail": "删除成功"}
+
+
+@app.post("/freeze-rules/{rule_id}/activate", response_model=schemas.FreezeRule, tags=["冻结日历"])
+def activate_freeze_rule(
+    rule_id: int,
+    req: schemas.FreezeRuleToggleRequest,
+    db: Session = Depends(get_db),
+):
+    return services.activate_freeze_rule(db, rule_id, req.operator_id)
+
+
+@app.post("/freeze-rules/{rule_id}/deactivate", response_model=schemas.FreezeRule, tags=["冻结日历"])
+def deactivate_freeze_rule(
+    rule_id: int,
+    req: schemas.FreezeRuleToggleRequest,
+    db: Session = Depends(get_db),
+):
+    return services.deactivate_freeze_rule(db, rule_id, req.operator_id)
+
+
+@app.get("/freeze-rules/{rule_id}/audit-logs", tags=["冻结日历"])
+def get_freeze_rule_audit_logs(rule_id: int, db: Session = Depends(get_db)):
+    rule = services.get_freeze_rule(db, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="冻结规则不存在")
+    
+    logs = services.get_freeze_audit_logs(db, rule_id)
+    result = []
+    for log in logs:
+        operator = log.operator
+        result.append({
+            "id": log.id,
+            "action": log.action.value if log.action else None,
+            "operator_id": log.operator_id,
+            "operator_username": operator.username if operator else None,
+            "operator_name": operator.display_name if operator else None,
+            "detail": log.detail,
+            "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+            "target_window_id": log.target_window_id,
+            "target_plan_id": log.target_plan_id,
+            "target_item_id": log.target_item_id,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        })
+    return result
+
+
+@app.post("/freeze-rules/check", response_model=schemas.FreezeCheckResult, tags=["冻结日历"])
+def check_freeze(
+    environment_id: int = Query(..., description="环境ID"),
+    start_time: datetime = Query(..., description="开始时间"),
+    end_time: datetime = Query(..., description="结束时间"),
+    scope: str = Query("ALL", description="检查范围 (CREATE/SUBMIT/APPROVE/ALL)"),
+    db: Session = Depends(get_db),
+):
+    scope_enum = models.FreezeRuleScope.ALL
+    try:
+        scope_enum = models.FreezeRuleScope(scope)
+    except ValueError:
+        pass
+    
+    conflicts = services.check_freeze_conflicts(
+        db, environment_id, start_time, end_time, scope_enum
+    )
+    
+    conflict_items = []
+    for rule in conflicts:
+        conflict_items.append(schemas.FreezeConflictItem(
+            rule_id=rule.id,
+            rule_name=rule.name,
+            freeze_scope=rule.freeze_scope.value if rule.freeze_scope else "ALL",
+            reason=rule.reason,
+            date_from=rule.date_from,
+            date_to=rule.date_to,
+            conflict_reason=services._build_freeze_conflict_reason(rule, scope),
+        ))
+    
+    return schemas.FreezeCheckResult(
+        has_conflict=len(conflicts) > 0,
+        conflicts=conflict_items,
+    )
+
+
+# ========== Freeze Rule Import/Export ==========
+
+@app.post("/freeze-rules/export", tags=["冻结日历导入导出"])
+def export_freeze_rules(
+    rule_ids: Optional[List[int]] = Query(None),
+    environment_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    data = services.export_freeze_rules(db, rule_ids, environment_id)
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    file_path = os.path.join(export_dir, f"freeze_rules_{ts}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return {
+        "detail": "导出成功",
+        "file_path": file_path,
+        "storage_location": "system_tempdir_outside_repo",
+        "count": len(data),
+        "data": data,
+    }
+
+
+@app.post("/freeze-rules/import", response_model=schemas.FreezeImportResult, tags=["冻结日历导入导出"])
+def import_freeze_rules(req: schemas.FreezeImportRequest, db: Session = Depends(get_db)):
+    return services.import_freeze_rules(db, req)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

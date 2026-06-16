@@ -221,6 +221,7 @@ class DiffType(str, enum.Enum):
     SLOT_CHANGED = "SLOT_CHANGED"
     WINDOW_STATUS_CHANGED = "WINDOW_STATUS_CHANGED"
     CONFLICT_CHANGED = "CONFLICT_CHANGED"
+    FREEZE_CONFLICT = "FREEZE_CONFLICT"
     NO_CHANGE = "NO_CHANGE"
 
 
@@ -336,4 +337,72 @@ class PlanAuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     plan = relationship("SchedulePlan", back_populates="audit_logs")
+    operator = relationship("User", foreign_keys=[operator_id])
+
+
+# ============== Freeze Calendar ==============
+
+class FreezeRuleStatus(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
+class FreezeRuleScope(str, enum.Enum):
+    CREATE = "CREATE"
+    SUBMIT = "SUBMIT"
+    APPROVE = "APPROVE"
+    ALL = "ALL"
+
+
+class FreezeAction(str, enum.Enum):
+    FREEZE_CREATE = "FREEZE_CREATE"
+    FREEZE_UPDATE = "FREEZE_UPDATE"
+    FREEZE_DELETE = "FREEZE_DELETE"
+    FREEZE_ACTIVATE = "FREEZE_ACTIVATE"
+    FREEZE_DEACTIVATE = "FREEZE_DEACTIVATE"
+    FREEZE_HIT_WINDOW = "FREEZE_HIT_WINDOW"
+    FREEZE_HIT_PLAN = "FREEZE_HIT_PLAN"
+    FREEZE_IMPORT = "FREEZE_IMPORT"
+    FREEZE_EXPORT = "FREEZE_EXPORT"
+
+
+class FreezeRule(Base):
+    __tablename__ = "freeze_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    environment_id = Column(Integer, ForeignKey("environments.id"), nullable=False)
+    freeze_scope = Column(Enum(FreezeRuleScope), default=FreezeRuleScope.ALL, nullable=False)
+    date_from = Column(DateTime, nullable=False)
+    date_to = Column(DateTime, nullable=False)
+    start_time = Column(String(5), nullable=True)
+    end_time = Column(String(5), nullable=True)
+    reason = Column(Text, nullable=True)
+    status = Column(Enum(FreezeRuleStatus), default=FreezeRuleStatus.ACTIVE, nullable=False)
+    remark = Column(Text, nullable=True)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    environment = relationship("Environment")
+    creator = relationship("User", foreign_keys=[creator_id])
+    audit_logs = relationship("FreezeAuditLog", back_populates="rule", cascade="all, delete-orphan", order_by="FreezeAuditLog.created_at")
+
+
+class FreezeAuditLog(Base):
+    __tablename__ = "freeze_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, ForeignKey("freeze_rules.id"), nullable=False)
+    action = Column(Enum(FreezeAction), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    detail = Column(Text, nullable=True)
+    snapshot = Column(Text, nullable=True)
+    target_window_id = Column(Integer, nullable=True)
+    target_plan_id = Column(Integer, nullable=True)
+    target_item_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    rule = relationship("FreezeRule", back_populates="audit_logs")
     operator = relationship("User", foreign_keys=[operator_id])
