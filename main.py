@@ -176,6 +176,23 @@ def submit_window(win_id: int, req: schemas.SubmitRequest, db: Session = Depends
 
 @app.post("/maintenance-windows/{win_id}/approve", response_model=schemas.MaintenanceWindow, tags=["维护窗口"])
 def approve_window(win_id: int, req: schemas.ApproveRequest, db: Session = Depends(get_db)):
+    win = services.get_maintenance_window(db, win_id)
+    if not win:
+        raise HTTPException(status_code=404, detail="维护窗口不存在")
+    env_id = win.environment_id
+
+    delegation = services.can_user_act_as_approver(db, req.operator_id, env_id, "WINDOW_APPROVE")
+    if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
+        raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
+
+    if delegation.is_delegated:
+        services.record_proxy_delegate_action(
+            db, req.operator_id, env_id, "WINDOW_APPROVE",
+            f"代理人代办窗口审批：窗口ID={win_id}, 审批人={req.operator_id}",
+            target_window_id=win_id,
+        )
+        db.commit()
+
     return services.approve_window(db, win_id, req)
 
 
@@ -539,6 +556,23 @@ def confirm_schedule_plan(
     req: schemas.SchedulePlanConfirm,
     db: Session = Depends(get_db),
 ):
+    plan = services.get_schedule_plan(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="排期方案不存在")
+    env_id = plan.environment_id
+
+    delegation = services.can_user_act_as_approver(db, req.operator_id, env_id, "PLAN_CONFIRM")
+    if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
+        raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
+
+    if delegation.is_delegated:
+        services.record_proxy_delegate_action(
+            db, req.operator_id, env_id, "PLAN_CONFIRM",
+            f"代理人代办计划确认：方案ID={plan_id}",
+            target_plan_id=plan_id,
+        )
+        db.commit()
+
     return services.confirm_schedule_plan(db, plan_id, req)
 
 
@@ -699,6 +733,23 @@ def activate_freeze_rule(
     req: schemas.FreezeRuleToggleRequest,
     db: Session = Depends(get_db),
 ):
+    rule = services.get_freeze_rule(db, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="冻结规则不存在")
+    env_id = rule.environment_id
+
+    delegation = services.can_user_act_as_approver(db, req.operator_id, env_id, "FREEZE_TOGGLE")
+    if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
+        raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
+
+    if delegation.is_delegated:
+        services.record_proxy_delegate_action(
+            db, req.operator_id, env_id, "FREEZE_TOGGLE",
+            f"代理人代办冻结规则激活：规则ID={rule_id}",
+            target_window_id=rule_id,
+        )
+        db.commit()
+
     return services.activate_freeze_rule(db, rule_id, req.operator_id)
 
 
@@ -708,6 +759,23 @@ def deactivate_freeze_rule(
     req: schemas.FreezeRuleToggleRequest,
     db: Session = Depends(get_db),
 ):
+    rule = services.get_freeze_rule(db, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="冻结规则不存在")
+    env_id = rule.environment_id
+
+    delegation = services.can_user_act_as_approver(db, req.operator_id, env_id, "FREEZE_TOGGLE")
+    if not services.user_can_approve(db, req.operator_id) and not delegation.is_delegated:
+        raise HTTPException(status_code=403, detail="当前用户无审批权限，且无有效的代理授权")
+
+    if delegation.is_delegated:
+        services.record_proxy_delegate_action(
+            db, req.operator_id, env_id, "FREEZE_TOGGLE",
+            f"代理人代办冻结规则停用：规则ID={rule_id}",
+            target_window_id=rule_id,
+        )
+        db.commit()
+
     return services.deactivate_freeze_rule(db, rule_id, req.operator_id)
 
 
@@ -903,6 +971,234 @@ def _check_freeze_manage_permission(db: Session, operator_id: int):
 @app.post("/freeze-rules/import", response_model=schemas.FreezeImportResult, tags=["冻结日历导入导出"])
 def import_freeze_rules(req: schemas.FreezeImportRequest, db: Session = Depends(get_db)):
     return services.import_freeze_rules(db, req)
+
+
+# ========== Approval Proxy Center ==========
+
+def _check_proxy_manage_permission(db: Session, operator_id: int, owner_approver_id: Optional[int] = None):
+    if not services.user_can_approve(db, operator_id):
+        raise HTTPException(status_code=403, detail="只有审批角色可以管理代理授权")
+    if owner_approver_id is not None:
+        if operator_id != owner_approver_id and not services.user_can_approve(db, operator_id):
+            raise HTTPException(status_code=403, detail="无权限管理该代理授权")
+
+
+@app.post("/approval-proxies", response_model=schemas.ApprovalProxy, tags=["审批值班代理中心"])
+def create_proxy(proxy_in: schemas.ApprovalProxyCreate, db: Session = Depends(get_db)):
+    _check_proxy_manage_permission(db, proxy_in.creator_id, proxy_in.approver_id)
+    return services.create_approval_proxy(db, proxy_in)
+
+
+@app.get("/approval-proxies", response_model=List[schemas.ApprovalProxy], tags=["审批值班代理中心"])
+def list_proxies(
+    approver_id: Optional[int] = Query(None),
+    proxy_user_id: Optional[int] = Query(None),
+    environment_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None, description="ACTIVATE/INACTIVE/REVOKED/EXPIRED"),
+    operator_id: int = Query(..., description="查询人ID"),
+    db: Session = Depends(get_db),
+):
+    user = services.get_user(db, operator_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.ProxyStatus(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"无效状态: {status}")
+
+    proxies = services.list_approval_proxies(db, approver_id, proxy_user_id, environment_id, status_enum)
+
+    if not services.user_can_approve(db, operator_id):
+        proxies = [
+            p for p in proxies
+            if p.approver_id == operator_id or p.proxy_user_id == operator_id
+        ]
+
+    return proxies
+
+
+@app.get("/approval-proxies/{proxy_id}", tags=["审批值班代理中心"])
+def get_proxy(
+    proxy_id: int,
+    operator_id: int = Query(..., description="查询人ID"),
+    db: Session = Depends(get_db),
+):
+    proxy = services.get_approval_proxy(db, proxy_id)
+    if not proxy:
+        raise HTTPException(status_code=404, detail="代理授权不存在")
+
+    user = services.get_user(db, operator_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    if not services.user_can_approve(db, operator_id):
+        if proxy.approver_id != operator_id and proxy.proxy_user_id != operator_id:
+            raise HTTPException(status_code=403, detail="无权限查看该代理授权")
+
+    audit_logs = []
+    for log in services.get_proxy_audit_logs(db, proxy_id):
+        operator = log.operator
+        audit_logs.append({
+            "id": log.id,
+            "proxy_id": log.proxy_id,
+            "action": log.action.value if log.action else None,
+            "operator_id": log.operator_id,
+            "operator_username": operator.username if operator else None,
+            "operator_name": operator.display_name if operator else None,
+            "detail": log.detail,
+            "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+            "target_window_id": log.target_window_id,
+            "target_plan_id": log.target_plan_id,
+            "target_item_id": log.target_item_id,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        })
+
+    return {
+        "id": proxy.id,
+        "approver_id": proxy.approver_id,
+        "proxy_user_id": proxy.proxy_user_id,
+        "environment_id": proxy.environment_id,
+        "delegate_scope": json.loads(proxy.delegate_scope) if isinstance(proxy.delegate_scope, str) else proxy.delegate_scope,
+        "valid_from": proxy.valid_from.isoformat() if proxy.valid_from else None,
+        "valid_to": proxy.valid_to.isoformat() if proxy.valid_to else None,
+        "status": proxy.status.value if proxy.status else None,
+        "reason": proxy.reason,
+        "remark": proxy.remark,
+        "creator_id": proxy.creator_id,
+        "created_at": proxy.created_at.isoformat() if proxy.created_at else None,
+        "updated_at": proxy.updated_at.isoformat() if proxy.updated_at else None,
+        "approver": proxy.approver,
+        "proxy_user": proxy.proxy_user,
+        "environment": proxy.environment,
+        "creator": proxy.creator,
+        "audit_logs": audit_logs,
+    }
+
+
+@app.post("/approval-proxies/{proxy_id}/deactivate", response_model=schemas.ApprovalProxy, tags=["审批值班代理中心"])
+def deactivate_proxy(
+    proxy_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.deactivate_approval_proxy(db, proxy_id, operator_id)
+
+
+@app.post("/approval-proxies/{proxy_id}/reactivate", response_model=schemas.ApprovalProxy, tags=["审批值班代理中心"])
+def reactivate_proxy(
+    proxy_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    return services.reactivate_approval_proxy(db, proxy_id, operator_id)
+
+
+@app.post("/approval-proxies/{proxy_id}/revoke", response_model=schemas.ApprovalProxy, tags=["审批值班代理中心"])
+def revoke_proxy(
+    proxy_id: int,
+    operator_id: int = Query(..., description="操作人ID"),
+    reason: Optional[str] = Query(None, description="撤销原因"),
+    db: Session = Depends(get_db),
+):
+    return services.revoke_approval_proxy(db, proxy_id, operator_id, reason)
+
+
+@app.get("/approval-proxies/{proxy_id}/audit-logs", tags=["审批值班代理中心"])
+def get_proxy_audit_logs(
+    proxy_id: int,
+    operator_id: int = Query(..., description="查询人ID"),
+    db: Session = Depends(get_db),
+):
+    proxy = services.get_approval_proxy(db, proxy_id)
+    if not proxy:
+        raise HTTPException(status_code=404, detail="代理授权不存在")
+
+    user = services.get_user(db, operator_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    if not services.user_can_approve(db, operator_id):
+        if proxy.approver_id != operator_id and proxy.proxy_user_id != operator_id:
+            raise HTTPException(status_code=403, detail="无权限查看该代理授权审计日志")
+
+    logs = services.get_proxy_audit_logs(db, proxy_id)
+    result = []
+    for log in logs:
+        operator = log.operator
+        result.append({
+            "id": log.id,
+            "proxy_id": log.proxy_id,
+            "action": log.action.value if log.action else None,
+            "operator_id": log.operator_id,
+            "operator_username": operator.username if operator else None,
+            "operator_name": operator.display_name if operator else None,
+            "detail": log.detail,
+            "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+            "target_window_id": log.target_window_id,
+            "target_plan_id": log.target_plan_id,
+            "target_item_id": log.target_item_id,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        })
+    return result
+
+
+@app.get("/approval-proxies/check/delegation", response_model=schemas.ProxyDelegationCheckResult, tags=["审批值班代理中心"])
+def check_proxy_delegation(
+    proxy_user_id: int = Query(..., description="代理人ID"),
+    environment_id: int = Query(..., description="环境ID"),
+    required_scope: str = Query(..., description="所需权限范围: WINDOW_APPROVE/PLAN_CONFIRM/FREEZE_TOGGLE"),
+    db: Session = Depends(get_db),
+):
+    valid_scopes = {"WINDOW_APPROVE", "PLAN_CONFIRM", "FREEZE_TOGGLE"}
+    if required_scope not in valid_scopes:
+        raise HTTPException(status_code=400, detail=f"无效权限范围: {required_scope}")
+    return services.check_proxy_delegation(db, proxy_user_id, environment_id, required_scope)
+
+
+@app.post("/approval-proxies/export", tags=["审批值班代理中心导入导出"])
+def export_proxies(
+    proxy_ids: Optional[List[int]] = Query(None),
+    approver_id: Optional[int] = Query(None),
+    environment_id: Optional[int] = Query(None),
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    if not services.user_can_approve(db, operator_id):
+        raise HTTPException(status_code=403, detail="只有审批角色可以导出代理授权")
+
+    data = services.export_approval_proxies(db, proxy_ids, approver_id, environment_id)
+    export_dir = os.path.join(tempfile.gettempdir(), "maintenance_window_exports")
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    file_path = os.path.join(export_dir, f"approval_proxies_{ts}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return {
+        "detail": "导出成功",
+        "file_path": file_path,
+        "storage_location": "system_tempdir_outside_repo",
+        "count": len(data),
+        "data": data,
+    }
+
+
+@app.post("/approval-proxies/import", response_model=schemas.ProxyImportResult, tags=["审批值班代理中心导入导出"])
+def import_proxies(req: schemas.ProxyImportRequest, db: Session = Depends(get_db)):
+    return services.import_approval_proxies(db, req)
+
+
+@app.post("/approval-proxies/expire-stale", tags=["审批值班代理中心"])
+def expire_stale_proxies_endpoint(
+    operator_id: int = Query(..., description="操作人ID"),
+    db: Session = Depends(get_db),
+):
+    if not services.user_can_approve(db, operator_id):
+        raise HTTPException(status_code=403, detail="只有审批角色可以触发过期扫描")
+    count = services.expire_stale_proxies(db)
+    return {"detail": f"已处理 {count} 条过期代理授权", "expired_count": count}
 
 
 if __name__ == "__main__":

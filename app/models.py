@@ -466,3 +466,66 @@ class FreezeRecoveryLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     operator = relationship("User", foreign_keys=[operator_id])
+
+
+# ============== Approval Proxy Center ==============
+
+class ProxyStatus(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
+class ProxyAction(str, enum.Enum):
+    PROXY_CREATE = "PROXY_CREATE"
+    PROXY_DEACTIVATE = "PROXY_DEACTIVATE"
+    PROXY_REACTIVATE = "PROXY_REACTIVATE"
+    PROXY_REVOKE = "PROXY_REVOKE"
+    PROXY_EXPIRE = "PROXY_EXPIRE"
+    PROXY_DELEGATE_ACTION = "PROXY_DELEGATE_ACTION"
+    PROXY_DELEGATE_REJECT = "PROXY_DELEGATE_REJECT"
+    PROXY_IMPORT = "PROXY_IMPORT"
+    PROXY_EXPORT = "PROXY_EXPORT"
+
+
+class ApprovalProxy(Base):
+    __tablename__ = "approval_proxies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    approver_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    proxy_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    environment_id = Column(Integer, ForeignKey("environments.id"), nullable=False)
+    delegate_scope = Column(Text, nullable=False)
+    valid_from = Column(DateTime, nullable=False)
+    valid_to = Column(DateTime, nullable=False)
+    status = Column(Enum(ProxyStatus), default=ProxyStatus.ACTIVE, nullable=False)
+    reason = Column(Text, nullable=True)
+    remark = Column(Text, nullable=True)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    approver = relationship("User", foreign_keys=[approver_id])
+    proxy_user = relationship("User", foreign_keys=[proxy_user_id])
+    environment = relationship("Environment")
+    creator = relationship("User", foreign_keys=[creator_id])
+    audit_logs = relationship("ProxyAuditLog", back_populates="proxy", cascade="all, delete-orphan", order_by="ProxyAuditLog.created_at")
+
+
+class ProxyAuditLog(Base):
+    __tablename__ = "proxy_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    proxy_id = Column(Integer, ForeignKey("approval_proxies.id"), nullable=False)
+    action = Column(Enum(ProxyAction), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    detail = Column(Text, nullable=True)
+    snapshot = Column(Text, nullable=True)
+    target_window_id = Column(Integer, nullable=True)
+    target_plan_id = Column(Integer, nullable=True)
+    target_item_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    proxy = relationship("ApprovalProxy", back_populates="audit_logs")
+    operator = relationship("User", foreign_keys=[operator_id])

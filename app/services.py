@@ -359,7 +359,8 @@ def approve_window(db: Session, win_id: int, req: schemas.ApproveRequest) -> mod
     if db_win.status != WindowStatus.SUBMITTED:
         raise BusinessError("仅已提交状态可以审批")
 
-    if not user_can_approve(db, req.operator_id):
+    delegation = can_user_act_as_approver(db, req.operator_id, db_win.environment_id, "WINDOW_APPROVE")
+    if not user_can_approve(db, req.operator_id) and not delegation.is_delegated:
         raise BusinessError("当前用户无审批权限", 403)
 
     approver = get_user(db, req.operator_id)
@@ -1493,14 +1494,20 @@ def _check_plan_permission(
         raise BusinessError("只有创建人或审批人可以提交审批", 403)
     
     if action == "approve":
-        if not is_approver:
-            raise BusinessError("只有审批角色可以审批方案", 403)
-        return True
+        if is_approver:
+            return True
+        delegation = can_user_act_as_approver(db, operator_id, plan.environment_id, "PLAN_CONFIRM")
+        if delegation.is_delegated:
+            return True
+        raise BusinessError("只有审批角色可以审批方案", 403)
     
     if action == "confirm":
         if is_owner:
             return True
         if is_approver:
+            return True
+        delegation = can_user_act_as_approver(db, operator_id, plan.environment_id, "PLAN_CONFIRM")
+        if delegation.is_delegated:
             return True
         if is_shared_template:
             if plan.creator_id != operator_id:
@@ -3122,6 +3129,9 @@ def create_freeze_rule(
     scope_map = {s.value: s for s in models.FreezeRuleScope}
     freeze_scope = scope_map.get(rule_in.freeze_scope, models.FreezeRuleScope.ALL)
 
+    status_map = {s.value: s for s in models.FreezeRuleStatus}
+    freeze_status = status_map.get(rule_in.status, models.FreezeRuleStatus.ACTIVE) if hasattr(rule_in, 'status') and rule_in.status else models.FreezeRuleStatus.ACTIVE
+
     overlap_warnings = _detect_rule_time_overlaps(
         db, rule_in.environment_id, rule_in.date_from, rule_in.date_to,
         rule_in.start_time, rule_in.end_time, freeze_scope,
@@ -3137,7 +3147,7 @@ def create_freeze_rule(
         start_time=rule_in.start_time,
         end_time=rule_in.end_time,
         reason=rule_in.reason,
-        status=models.FreezeRuleStatus.ACTIVE,
+        status=freeze_status,
         remark=rule_in.remark,
         creator_id=rule_in.creator_id,
     )
@@ -3284,11 +3294,14 @@ def delete_freeze_rule(db: Session, rule_id: int, operator_id: int) -> None:
 def activate_freeze_rule(
     db: Session, rule_id: int, operator_id: int
 ) -> models.FreezeRule:
-    _check_freeze_manage_permission(db, operator_id)
-
     db_rule = get_freeze_rule(db, rule_id)
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+
+    if not user_can_approve(db, operator_id):
+        delegation = can_user_act_as_approver(db, operator_id, db_rule.environment_id, "FREEZE_TOGGLE")
+        if not delegation.is_delegated:
+            raise BusinessError("只有审批角色可以管理冻结规则", 403)
 
     old_status = db_rule.status
     db_rule.status = models.FreezeRuleStatus.ACTIVE
@@ -3311,11 +3324,14 @@ def activate_freeze_rule(
 def deactivate_freeze_rule(
     db: Session, rule_id: int, operator_id: int
 ) -> models.FreezeRule:
-    _check_freeze_manage_permission(db, operator_id)
-
     db_rule = get_freeze_rule(db, rule_id)
     if not db_rule:
         raise BusinessError(f"冻结规则 ID={rule_id} 不存在", 404)
+
+    if not user_can_approve(db, operator_id):
+        delegation = can_user_act_as_approver(db, operator_id, db_rule.environment_id, "FREEZE_TOGGLE")
+        if not delegation.is_delegated:
+            raise BusinessError("只有审批角色可以管理冻结规则", 403)
 
     old_status = db_rule.status
     db_rule.status = models.FreezeRuleStatus.INACTIVE
@@ -4251,4 +4267,711 @@ def get_recovery_center_summary(db: Session) -> schemas.FreezeRecoveryCenterSumm
         total_still_blocked=still_blocked,
         by_rule=list(by_rule.values()),
         by_plan=list(by_plan.values()),
+    )
+
+
+# ============== Approval Proxy Center Service ==============
+
+VALID_DELEGATE_SCOPES = {"WINDOW_APPROVE", "PLAN_CONFIRM", "FREEZE_TOGGLE"}
+
+
+def _proxy_snapshot(proxy: models.ApprovalProxy) -> str:
+    return json.dumps({
+        "id": proxy.id,
+        "approver_id": proxy.approver_id,
+        "proxy_user_id": proxy.proxy_user_id,
+        "environment_id": proxy.environment_id,
+        "delegate_scope": json.loads(proxy.delegate_scope) if isinstance(proxy.delegate_scope, str) else proxy.delegate_scope,
+        "valid_from": proxy.valid_from.isoformat() if proxy.valid_from else None,
+        "valid_to": proxy.valid_to.isoformat() if proxy.valid_to else None,
+        "status": proxy.status.value if proxy.status else None,
+        "reason": proxy.reason,
+        "remark": proxy.remark,
+        "creator_id": proxy.creator_id,
+    }, ensure_ascii=False)
+
+
+def _add_proxy_audit_log(
+    db: Session,
+    proxy: models.ApprovalProxy,
+    action: models.ProxyAction,
+    operator_id: int,
+    detail: Optional[str] = None,
+    target_window_id: Optional[int] = None,
+    target_plan_id: Optional[int] = None,
+    target_item_id: Optional[int] = None,
+):
+    log = models.ProxyAuditLog(
+        proxy_id=proxy.id,
+        action=action,
+        operator_id=operator_id,
+        detail=detail,
+        snapshot=_proxy_snapshot(proxy),
+        target_window_id=target_window_id,
+        target_plan_id=target_plan_id,
+        target_item_id=target_item_id,
+    )
+    db.add(log)
+
+
+def expire_stale_proxies(db: Session) -> int:
+    now = datetime.utcnow()
+    expired_count = 0
+    active_proxies = db.query(models.ApprovalProxy).filter(
+        models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
+        models.ApprovalProxy.valid_to < now,
+    ).all()
+    for proxy in active_proxies:
+        proxy.status = models.ProxyStatus.EXPIRED
+        proxy.updated_at = now
+        _add_proxy_audit_log(
+            db, proxy, models.ProxyAction.PROXY_EXPIRE, proxy.creator_id,
+            detail=f"代理授权过期: {proxy.valid_to.isoformat()}",
+        )
+        expired_count += 1
+    if expired_count:
+        db.commit()
+    return expired_count
+
+
+def create_approval_proxy(
+    db: Session, proxy_in: schemas.ApprovalProxyCreate
+) -> models.ApprovalProxy:
+    if not user_can_approve(db, proxy_in.approver_id):
+        raise BusinessError("被代理人(approver_id)必须拥有审批权限", 403)
+
+    approver = get_user(db, proxy_in.approver_id)
+    if not approver:
+        raise BusinessError(f"审批人 ID={proxy_in.approver_id} 不存在", 404)
+
+    proxy_user = get_user(db, proxy_in.proxy_user_id)
+    if not proxy_user:
+        raise BusinessError(f"代理人 ID={proxy_in.proxy_user_id} 不存在", 404)
+
+    if proxy_in.approver_id == proxy_in.proxy_user_id:
+        raise BusinessError("不能把代理授权给自己", 400)
+
+    env = get_environment(db, proxy_in.environment_id)
+    if not env:
+        raise BusinessError(f"环境 ID={proxy_in.environment_id} 不存在", 404)
+
+    creator = get_user(db, proxy_in.creator_id)
+    if not creator:
+        raise BusinessError(f"创建人 ID={proxy_in.creator_id} 不存在", 404)
+
+    if proxy_in.creator_id != proxy_in.approver_id:
+        if not user_can_approve(db, proxy_in.creator_id):
+            raise BusinessError("只有审批角色可以创建代理授权", 403)
+
+    delegate_scope_str = json.dumps(proxy_in.delegate_scope, ensure_ascii=False)
+    overlapping = db.query(models.ApprovalProxy).filter(
+        models.ApprovalProxy.approver_id == proxy_in.approver_id,
+        models.ApprovalProxy.proxy_user_id == proxy_in.proxy_user_id,
+        models.ApprovalProxy.environment_id == proxy_in.environment_id,
+        models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
+        models.ApprovalProxy.valid_to > proxy_in.valid_from,
+        models.ApprovalProxy.valid_from < proxy_in.valid_to,
+    ).all()
+
+    for existing in overlapping:
+        existing_scope = json.loads(existing.delegate_scope) if isinstance(existing.delegate_scope, str) else existing.delegate_scope
+        if set(proxy_in.delegate_scope) & set(existing_scope):
+            raise BusinessError(
+                f"同一审批人→代理人在同一环境下存在时段重叠的活跃代理授权"
+                f"(ID={existing.id}, 时段={existing.valid_from.isoformat()}~{existing.valid_to.isoformat()})"
+                f"，代理范围冲突: {set(proxy_in.delegate_scope) & set(existing_scope)}",
+                409,
+            )
+
+    conflict_proxies = db.query(models.ApprovalProxy).filter(
+        models.ApprovalProxy.proxy_user_id == proxy_in.proxy_user_id,
+        models.ApprovalProxy.environment_id == proxy_in.environment_id,
+        models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
+        models.ApprovalProxy.valid_to > proxy_in.valid_from,
+        models.ApprovalProxy.valid_from < proxy_in.valid_to,
+    ).all()
+
+    env_conflicts = []
+    for cp in conflict_proxies:
+        cp_scope = json.loads(cp.delegate_scope) if isinstance(cp.delegate_scope, str) else cp.delegate_scope
+        if set(proxy_in.delegate_scope) & set(cp_scope):
+            env_conflicts.append({
+                "proxy_id": cp.id,
+                "approver_id": cp.approver_id,
+                "overlapping_scopes": list(set(proxy_in.delegate_scope) & set(cp_scope)),
+            })
+
+    if env_conflicts:
+        conflict_detail = "; ".join([
+            f"与审批人ID={c['approver_id']}的授权ID={c['proxy_id']}范围冲突: {c['overlapping_scopes']}"
+            for c in env_conflicts
+        ])
+        raise BusinessError(
+            f"同一代理人在同一环境下存在时段重叠的代理授权，范围冲突: {conflict_detail}",
+            409,
+        )
+
+    now = datetime.utcnow()
+    initial_status = models.ProxyStatus.ACTIVE if proxy_in.valid_from <= now else models.ProxyStatus.INACTIVE
+
+    proxy = models.ApprovalProxy(
+        approver_id=proxy_in.approver_id,
+        proxy_user_id=proxy_in.proxy_user_id,
+        environment_id=proxy_in.environment_id,
+        delegate_scope=delegate_scope_str,
+        valid_from=proxy_in.valid_from,
+        valid_to=proxy_in.valid_to,
+        status=initial_status,
+        reason=proxy_in.reason,
+        remark=proxy_in.remark,
+        creator_id=proxy_in.creator_id,
+    )
+    db.add(proxy)
+    db.flush()
+
+    _add_proxy_audit_log(
+        db, proxy, models.ProxyAction.PROXY_CREATE, proxy_in.creator_id,
+        detail=f"创建代理授权: 审批人={approver.display_name}, 代理人={proxy_user.display_name}, "
+               f"环境={env.name}, 范围={proxy_in.delegate_scope}, "
+               f"时段={proxy_in.valid_from.isoformat()}~{proxy_in.valid_to.isoformat()}",
+    )
+
+    db.commit()
+    db.refresh(proxy)
+    return proxy
+
+
+def get_approval_proxy(db: Session, proxy_id: int) -> Optional[models.ApprovalProxy]:
+    return db.query(models.ApprovalProxy).filter(models.ApprovalProxy.id == proxy_id).first()
+
+
+def list_approval_proxies(
+    db: Session,
+    approver_id: Optional[int] = None,
+    proxy_user_id: Optional[int] = None,
+    environment_id: Optional[int] = None,
+    status: Optional[models.ProxyStatus] = None,
+) -> List[models.ApprovalProxy]:
+    expire_stale_proxies(db)
+    q = db.query(models.ApprovalProxy)
+    if approver_id is not None:
+        q = q.filter(models.ApprovalProxy.approver_id == approver_id)
+    if proxy_user_id is not None:
+        q = q.filter(models.ApprovalProxy.proxy_user_id == proxy_user_id)
+    if environment_id is not None:
+        q = q.filter(models.ApprovalProxy.environment_id == environment_id)
+    if status is not None:
+        q = q.filter(models.ApprovalProxy.status == status)
+    return q.order_by(models.ApprovalProxy.created_at.desc()).all()
+
+
+def deactivate_approval_proxy(
+    db: Session, proxy_id: int, operator_id: int
+) -> models.ApprovalProxy:
+    proxy = get_approval_proxy(db, proxy_id)
+    if not proxy:
+        raise BusinessError(f"代理授权 ID={proxy_id} 不存在", 404)
+
+    if proxy.status != models.ProxyStatus.ACTIVE:
+        raise BusinessError(f"只有 ACTIVE 状态可以停用，当前状态={proxy.status.value}", 400)
+
+    if operator_id != proxy.approver_id and not user_can_approve(db, operator_id):
+        raise BusinessError("只有原审批人或审批角色可以停用代理授权", 403)
+
+    proxy.status = models.ProxyStatus.INACTIVE
+    proxy.updated_at = datetime.utcnow()
+
+    _add_proxy_audit_log(
+        db, proxy, models.ProxyAction.PROXY_DEACTIVATE, operator_id,
+        detail=f"停用代理授权",
+    )
+
+    db.commit()
+    db.refresh(proxy)
+    return proxy
+
+
+def reactivate_approval_proxy(
+    db: Session, proxy_id: int, operator_id: int
+) -> models.ApprovalProxy:
+    proxy = get_approval_proxy(db, proxy_id)
+    if not proxy:
+        raise BusinessError(f"代理授权 ID={proxy_id} 不存在", 404)
+
+    if proxy.status not in [models.ProxyStatus.INACTIVE]:
+        raise BusinessError(f"只有 INACTIVE 状态可以重新启用，当前状态={proxy.status.value}", 400)
+
+    if operator_id != proxy.approver_id and not user_can_approve(db, operator_id):
+        raise BusinessError("只有原审批人或审批角色可以重新启用代理授权", 403)
+
+    if proxy.valid_to <= datetime.utcnow():
+        raise BusinessError("代理授权已过期，不能重新启用", 400)
+
+    if not user_can_approve(db, proxy.approver_id):
+        raise BusinessError("原审批人已无审批权限，不能重新启用代理授权", 403)
+
+    overlapping = db.query(models.ApprovalProxy).filter(
+        models.ApprovalProxy.approver_id == proxy.approver_id,
+        models.ApprovalProxy.proxy_user_id == proxy.proxy_user_id,
+        models.ApprovalProxy.environment_id == proxy.environment_id,
+        models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
+        models.ApprovalProxy.id != proxy.id,
+        models.ApprovalProxy.valid_to > proxy.valid_from,
+        models.ApprovalProxy.valid_from < proxy.valid_to,
+    ).all()
+
+    for existing in overlapping:
+        existing_scope = json.loads(existing.delegate_scope) if isinstance(existing.delegate_scope, str) else existing.delegate_scope
+        proxy_scope = json.loads(proxy.delegate_scope) if isinstance(proxy.delegate_scope, str) else proxy.delegate_scope
+        if set(proxy_scope) & set(existing_scope):
+            raise BusinessError(
+                f"重新启用会导致与现有活跃代理授权冲突(ID={existing.id})，范围冲突: {set(proxy_scope) & set(existing_scope)}",
+                409,
+            )
+
+    proxy.status = models.ProxyStatus.ACTIVE
+    proxy.updated_at = datetime.utcnow()
+
+    _add_proxy_audit_log(
+        db, proxy, models.ProxyAction.PROXY_REACTIVATE, operator_id,
+        detail=f"重新启用代理授权",
+    )
+
+    db.commit()
+    db.refresh(proxy)
+    return proxy
+
+
+def revoke_approval_proxy(
+    db: Session, proxy_id: int, operator_id: int, reason: Optional[str] = None
+) -> models.ApprovalProxy:
+    proxy = get_approval_proxy(db, proxy_id)
+    if not proxy:
+        raise BusinessError(f"代理授权 ID={proxy_id} 不存在", 404)
+
+    if proxy.status in [models.ProxyStatus.REVOKED, models.ProxyStatus.EXPIRED]:
+        raise BusinessError(f"当前状态={proxy.status.value}，不能撤销", 400)
+
+    if operator_id != proxy.approver_id and not user_can_approve(db, operator_id):
+        raise BusinessError("只有原审批人或审批角色可以撤销代理授权", 403)
+
+    old_status = proxy.status
+    proxy.status = models.ProxyStatus.REVOKED
+    proxy.updated_at = datetime.utcnow()
+
+    _add_proxy_audit_log(
+        db, proxy, models.ProxyAction.PROXY_REVOKE, operator_id,
+        detail=f"撤销代理授权: 原状态={old_status.value}" + (f"，原因: {reason}" if reason else ""),
+    )
+
+    db.commit()
+    db.refresh(proxy)
+    return proxy
+
+
+def check_proxy_delegation(
+    db: Session,
+    proxy_user_id: int,
+    environment_id: int,
+    required_scope: str,
+    now: Optional[datetime] = None,
+) -> schemas.ProxyDelegationCheckResult:
+    expire_stale_proxies(db)
+    if now is None:
+        now = datetime.utcnow()
+
+    active_proxies = db.query(models.ApprovalProxy).filter(
+        models.ApprovalProxy.proxy_user_id == proxy_user_id,
+        models.ApprovalProxy.environment_id == environment_id,
+        models.ApprovalProxy.status == models.ProxyStatus.ACTIVE,
+        models.ApprovalProxy.valid_from <= now,
+        models.ApprovalProxy.valid_to > now,
+    ).all()
+
+    for proxy in active_proxies:
+        scope_list = json.loads(proxy.delegate_scope) if isinstance(proxy.delegate_scope, str) else proxy.delegate_scope
+        if required_scope in scope_list:
+            return schemas.ProxyDelegationCheckResult(
+                is_delegated=True,
+                proxy_id=proxy.id,
+                original_approver_id=proxy.approver_id,
+                delegate_scope=scope_list,
+                valid_from=proxy.valid_from,
+                valid_to=proxy.valid_to,
+            )
+
+    return schemas.ProxyDelegationCheckResult(is_delegated=False)
+
+
+def can_user_act_as_approver(
+    db: Session,
+    user_id: int,
+    environment_id: int,
+    required_scope: str,
+) -> schemas.ProxyDelegationCheckResult:
+    if user_can_approve(db, user_id):
+        return schemas.ProxyDelegationCheckResult(is_delegated=False)
+
+    return check_proxy_delegation(db, user_id, environment_id, required_scope)
+
+
+def record_proxy_delegate_action(
+    db: Session,
+    proxy_user_id: int,
+    environment_id: int,
+    action_scope: str,
+    action_description: str,
+    target_window_id: Optional[int] = None,
+    target_plan_id: Optional[int] = None,
+    target_item_id: Optional[int] = None,
+) -> Optional[models.ProxyAuditLog]:
+    delegation = check_proxy_delegation(db, proxy_user_id, environment_id, action_scope)
+    if not delegation.is_delegated:
+        return None
+
+    proxy = get_approval_proxy(db, delegation.proxy_id)
+    if not proxy:
+        return None
+
+    log = models.ProxyAuditLog(
+        proxy_id=proxy.id,
+        action=models.ProxyAction.PROXY_DELEGATE_ACTION,
+        operator_id=proxy_user_id,
+        detail=f"代理人代办操作[{action_scope}]: {action_description}",
+        snapshot=_proxy_snapshot(proxy),
+        target_window_id=target_window_id,
+        target_plan_id=target_plan_id,
+        target_item_id=target_item_id,
+    )
+    db.add(log)
+    db.flush()
+    return log
+
+
+def record_proxy_delegate_reject(
+    db: Session,
+    proxy_user_id: int,
+    environment_id: int,
+    action_scope: str,
+    reject_reason: str,
+    target_window_id: Optional[int] = None,
+    target_plan_id: Optional[int] = None,
+    target_item_id: Optional[int] = None,
+) -> Optional[models.ProxyAuditLog]:
+    delegation = check_proxy_delegation(db, proxy_user_id, environment_id, action_scope)
+    if not delegation.is_delegated:
+        return None
+
+    proxy = get_approval_proxy(db, delegation.proxy_id)
+    if not proxy:
+        return None
+
+    log = models.ProxyAuditLog(
+        proxy_id=proxy.id,
+        action=models.ProxyAction.PROXY_DELEGATE_REJECT,
+        operator_id=proxy_user_id,
+        detail=f"代理人代办操作被拒[{action_scope}]: {reject_reason}",
+        snapshot=_proxy_snapshot(proxy),
+        target_window_id=target_window_id,
+        target_plan_id=target_plan_id,
+        target_item_id=target_item_id,
+    )
+    db.add(log)
+    db.flush()
+    return log
+
+
+def get_proxy_audit_logs(
+    db: Session, proxy_id: int
+) -> List[models.ProxyAuditLog]:
+    return db.query(models.ProxyAuditLog).filter(
+        models.ProxyAuditLog.proxy_id == proxy_id
+    ).order_by(models.ProxyAuditLog.created_at.desc()).all()
+
+
+def export_approval_proxies(
+    db: Session,
+    proxy_ids: Optional[List[int]] = None,
+    approver_id: Optional[int] = None,
+    environment_id: Optional[int] = None,
+) -> List[dict]:
+    expire_stale_proxies(db)
+    q = db.query(models.ApprovalProxy)
+    if proxy_ids:
+        q = q.filter(models.ApprovalProxy.id.in_(proxy_ids))
+    if approver_id is not None:
+        q = q.filter(models.ApprovalProxy.approver_id == approver_id)
+    if environment_id is not None:
+        q = q.filter(models.ApprovalProxy.environment_id == environment_id)
+
+    proxies = q.all()
+    result = []
+
+    for proxy in proxies:
+        approver = proxy.approver
+        proxy_user = proxy.proxy_user
+        env = proxy.environment
+        creator = proxy.creator
+
+        scope_list = json.loads(proxy.delegate_scope) if isinstance(proxy.delegate_scope, str) else proxy.delegate_scope
+
+        audit_logs_data = []
+        for log in proxy.audit_logs:
+            operator = log.operator
+            audit_logs_data.append({
+                "action": log.action.value if log.action else None,
+                "operator_username": operator.username if operator else None,
+                "operator_name": operator.display_name if operator else None,
+                "detail": log.detail,
+                "snapshot": json.loads(log.snapshot) if log.snapshot else {},
+                "target_window_id": log.target_window_id,
+                "target_plan_id": log.target_plan_id,
+                "target_item_id": log.target_item_id,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            })
+
+        result.append({
+            "approver_username": approver.username if approver else None,
+            "proxy_username": proxy_user.username if proxy_user else None,
+            "environment_name": env.name if env else None,
+            "delegate_scope": scope_list,
+            "valid_from": proxy.valid_from.isoformat() if proxy.valid_from else None,
+            "valid_to": proxy.valid_to.isoformat() if proxy.valid_to else None,
+            "status": proxy.status.value if proxy.status else "ACTIVE",
+            "reason": proxy.reason,
+            "remark": proxy.remark,
+            "creator_username": creator.username if creator else None,
+            "created_at": proxy.created_at.isoformat() if proxy.created_at else None,
+            "audit_logs": audit_logs_data,
+        })
+
+    return result
+
+
+def import_approval_proxies(
+    db: Session, req: schemas.ProxyImportRequest
+) -> schemas.ProxyImportResult:
+    operator = get_user(db, req.operator_id)
+    if not operator:
+        raise BusinessError(f"操作人 ID={req.operator_id} 不存在", 404)
+
+    if not user_can_approve(db, req.operator_id):
+        raise BusinessError("只有审批角色可以导入代理授权", 403)
+
+    total = len(req.proxies)
+    success = 0
+    skipped = 0
+    failed = 0
+    details = []
+
+    for idx, item in enumerate(req.proxies):
+        try:
+            approver_user = db.query(models.User).filter(
+                models.User.username == item.approver_username
+            ).first()
+            if not approver_user:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "approver_username": item.approver_username,
+                    "status": "failed",
+                    "reason": f"审批人 '{item.approver_username}' 不存在",
+                })
+                continue
+
+            if not user_can_approve(db, approver_user.id):
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "approver_username": item.approver_username,
+                    "status": "failed",
+                    "reason": f"用户 '{item.approver_username}' 不是审批角色",
+                })
+                continue
+
+            proxy_user = db.query(models.User).filter(
+                models.User.username == item.proxy_username
+            ).first()
+            if not proxy_user:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "approver_username": item.approver_username,
+                    "status": "failed",
+                    "reason": f"代理人 '{item.proxy_username}' 不存在",
+                })
+                continue
+
+            env = get_environment_by_name(db, item.environment_name)
+            if not env:
+                failed += 1
+                details.append({
+                    "index": idx,
+                    "approver_username": item.approver_username,
+                    "status": "failed",
+                    "reason": f"环境 '{item.environment_name}' 不存在",
+                })
+                continue
+
+            valid_from = datetime.fromisoformat(item.valid_from)
+            valid_to = datetime.fromisoformat(item.valid_to)
+
+            status_map = {s.value: s for s in models.ProxyStatus}
+            proxy_status = status_map.get(item.status, models.ProxyStatus.ACTIVE)
+
+            existing = db.query(models.ApprovalProxy).filter(
+                models.ApprovalProxy.approver_id == approver_user.id,
+                models.ApprovalProxy.proxy_user_id == proxy_user.id,
+                models.ApprovalProxy.environment_id == env.id,
+                models.ApprovalProxy.valid_from == valid_from,
+                models.ApprovalProxy.valid_to == valid_to,
+            ).first()
+
+            if existing:
+                if req.on_conflict == "skip":
+                    skipped += 1
+                    details.append({
+                        "index": idx,
+                        "approver_username": item.approver_username,
+                        "status": "skipped",
+                        "reason": "相同代理授权已存在，跳过",
+                    })
+                    continue
+                elif req.on_conflict == "overwrite":
+                    existing.delegate_scope = json.dumps(item.delegate_scope, ensure_ascii=False)
+                    existing.status = proxy_status
+                    existing.reason = item.reason
+                    existing.remark = item.remark
+                    existing.creator_id = req.operator_id
+                    existing.updated_at = datetime.utcnow()
+
+                    _add_proxy_audit_log(
+                        db, existing, models.ProxyAction.PROXY_IMPORT, req.operator_id,
+                        detail=f"覆盖导入代理授权",
+                    )
+
+                    success += 1
+                    details.append({
+                        "index": idx,
+                        "approver_username": item.approver_username,
+                        "status": "overwritten",
+                        "id": existing.id,
+                    })
+                    continue
+                else:
+                    failed += 1
+                    details.append({
+                        "index": idx,
+                        "approver_username": item.approver_username,
+                        "status": "failed",
+                        "reason": "相同代理授权已存在",
+                    })
+                    continue
+
+            resolved_creator_id = req.operator_id
+            if item.creator_username:
+                creator_user = db.query(models.User).filter(
+                    models.User.username == item.creator_username
+                ).first()
+                if creator_user:
+                    resolved_creator_id = creator_user.id
+
+            now = datetime.utcnow()
+            if proxy_status == models.ProxyStatus.ACTIVE and valid_from > now:
+                proxy_status = models.ProxyStatus.INACTIVE
+            if proxy_status == models.ProxyStatus.ACTIVE and valid_to <= now:
+                proxy_status = models.ProxyStatus.EXPIRED
+
+            new_proxy = models.ApprovalProxy(
+                approver_id=approver_user.id,
+                proxy_user_id=proxy_user.id,
+                environment_id=env.id,
+                delegate_scope=json.dumps(item.delegate_scope, ensure_ascii=False),
+                valid_from=valid_from,
+                valid_to=valid_to,
+                status=proxy_status,
+                reason=item.reason,
+                remark=item.remark,
+                creator_id=resolved_creator_id,
+            )
+            if item.created_at:
+                new_proxy.created_at = datetime.fromisoformat(item.created_at)
+
+            db.add(new_proxy)
+            db.flush()
+
+            if item.audit_logs:
+                for log_data in item.audit_logs:
+                    log_dict = log_data if isinstance(log_data, dict) else log_data
+                    if not log_dict:
+                        continue
+
+                    action_map = {a.value: a for a in models.ProxyAction}
+                    log_action = action_map.get(log_dict.get("action"), models.ProxyAction.PROXY_IMPORT)
+
+                    op_username = log_dict.get("operator_username")
+                    resolved_op_id = req.operator_id
+                    if op_username:
+                        op_user = db.query(models.User).filter(
+                            models.User.username == op_username
+                        ).first()
+                        if op_user:
+                            resolved_op_id = op_user.id
+
+                    snapshot_val = None
+                    if log_dict.get("snapshot"):
+                        snapshot_val = json.dumps(log_dict["snapshot"], ensure_ascii=False)
+
+                    audit_log = models.ProxyAuditLog(
+                        proxy_id=new_proxy.id,
+                        action=log_action,
+                        operator_id=resolved_op_id,
+                        detail=log_dict.get("detail"),
+                        snapshot=snapshot_val,
+                        target_window_id=log_dict.get("target_window_id"),
+                        target_plan_id=log_dict.get("target_plan_id"),
+                        target_item_id=log_dict.get("target_item_id"),
+                    )
+                    if log_dict.get("created_at"):
+                        audit_log.created_at = datetime.fromisoformat(log_dict["created_at"])
+                    db.add(audit_log)
+
+            _add_proxy_audit_log(
+                db, new_proxy, models.ProxyAction.PROXY_IMPORT, req.operator_id,
+                detail=f"导入代理授权: 审批人={item.approver_username}, 代理人={item.proxy_username}, 状态={proxy_status.value}",
+            )
+
+            success += 1
+            details.append({
+                "index": idx,
+                "approver_username": item.approver_username,
+                "status": "created",
+                "id": new_proxy.id,
+            })
+
+        except BusinessError as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "approver_username": item.approver_username if hasattr(item, 'approver_username') else "?",
+                "status": "failed",
+                "reason": e.message,
+            })
+        except Exception as e:
+            failed += 1
+            details.append({
+                "index": idx,
+                "approver_username": item.approver_username if hasattr(item, 'approver_username') else "?",
+                "status": "failed",
+                "reason": str(e),
+            })
+
+    db.commit()
+
+    return schemas.ProxyImportResult(
+        total=total,
+        success=success,
+        skipped=skipped,
+        failed=failed,
+        details=details,
     )

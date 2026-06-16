@@ -762,6 +762,7 @@ class FreezeRuleBase(BaseModel):
 
 class FreezeRuleCreate(FreezeRuleBase):
     creator_id: int
+    status: Optional[str] = Field("ACTIVE", pattern=r"^(ACTIVE|INACTIVE)$")
 
 
 class FreezeRuleUpdate(BaseModel):
@@ -956,3 +957,171 @@ class FreezeRecoveryCenterSummary(BaseModel):
     total_still_blocked: int
     by_rule: List[dict]
     by_plan: List[dict]
+
+
+# ============== Approval Proxy Center Schemas ==============
+
+class ApprovalProxyCreate(BaseModel):
+    approver_id: int
+    proxy_user_id: int
+    environment_id: int
+    delegate_scope: List[str]
+    valid_from: datetime
+    valid_to: datetime
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+    creator_id: int
+
+    @field_validator("delegate_scope", mode="before")
+    @classmethod
+    def _validate_delegate_scope(cls, v):
+        if isinstance(v, list):
+            valid = {"WINDOW_APPROVE", "PLAN_CONFIRM", "FREEZE_TOGGLE"}
+            for s in v:
+                if s not in valid:
+                    raise ValueError(f"不支持的代理范围: {s}，可选: {valid}")
+            if not v:
+                raise ValueError("delegate_scope 不能为空")
+            return v
+        raise ValueError("delegate_scope 必须是列表")
+
+    @validator("valid_to")
+    def valid_to_after_valid_from(cls, v, values):
+        if "valid_from" in values and v <= values["valid_from"]:
+            raise ValueError("valid_to 必须晚于 valid_from")
+        return v
+
+
+class ApprovalProxyUpdate(BaseModel):
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+    delegate_scope: Optional[List[str]] = None
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+
+    @field_validator("delegate_scope", mode="before")
+    @classmethod
+    def _validate_delegate_scope(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            valid = {"WINDOW_APPROVE", "PLAN_CONFIRM", "FREEZE_TOGGLE"}
+            for s in v:
+                if s not in valid:
+                    raise ValueError(f"不支持的代理范围: {s}，可选: {valid}")
+            if not v:
+                raise ValueError("delegate_scope 不能为空")
+            return v
+        raise ValueError("delegate_scope 必须是列表")
+
+
+class ApprovalProxy(BaseModel):
+    id: int
+    approver_id: int
+    proxy_user_id: int
+    environment_id: int
+    delegate_scope: List[str]
+    valid_from: datetime
+    valid_to: datetime
+    status: str
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+    creator_id: int
+    created_at: datetime
+    updated_at: datetime
+    approver: Optional[User] = None
+    proxy_user: Optional[User] = None
+    environment: Optional[Environment] = None
+    creator: Optional[User] = None
+
+    @field_validator("delegate_scope", mode="before")
+    @classmethod
+    def _parse_delegate_scope(cls, v: Any) -> List[str]:
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                data = json.loads(v)
+                if isinstance(data, list):
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return []
+
+    class Config:
+        from_attributes = True
+
+
+class ApprovalProxyDetail(ApprovalProxy):
+    audit_logs: List[dict] = []
+
+
+class ProxyAuditLogOut(BaseModel):
+    id: int
+    proxy_id: int
+    action: str
+    operator_id: int
+    operator_username: Optional[str] = None
+    operator_name: Optional[str] = None
+    detail: Optional[str] = None
+    snapshot: Optional[dict] = None
+    target_window_id: Optional[int] = None
+    target_plan_id: Optional[int] = None
+    target_item_id: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProxyDelegationCheckResult(BaseModel):
+    is_delegated: bool
+    proxy_id: Optional[int] = None
+    original_approver_id: Optional[int] = None
+    delegate_scope: Optional[List[str]] = None
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+
+
+class ProxyExportItem(BaseModel):
+    approver_username: str
+    proxy_username: str
+    environment_name: str
+    delegate_scope: List[str]
+    valid_from: str
+    valid_to: str
+    status: str
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+    creator_username: Optional[str] = None
+    created_at: Optional[str] = None
+    audit_logs: List[dict] = []
+
+
+class ProxyImportItem(BaseModel):
+    approver_username: str
+    proxy_username: str
+    environment_name: str
+    delegate_scope: List[str]
+    valid_from: str
+    valid_to: str
+    status: str
+    reason: Optional[str] = None
+    remark: Optional[str] = None
+    creator_username: Optional[str] = None
+    created_at: Optional[str] = None
+    audit_logs: Optional[List[dict]] = None
+
+
+class ProxyImportRequest(BaseModel):
+    proxies: List[ProxyImportItem]
+    operator_id: int
+    on_conflict: str = Field("skip", pattern=r"^(skip|overwrite|error)$")
+
+
+class ProxyImportResult(BaseModel):
+    total: int
+    success: int
+    skipped: int
+    failed: int
+    details: List[dict]
